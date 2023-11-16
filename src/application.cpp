@@ -17,12 +17,23 @@ class ApplicationImpl : public Application {
 
     void start() override;
     
+    ~ApplicationImpl();
+    
   private:
     void createVulkanInstance();
     void setupDebugMessenger();
+    void pickPhysicalDevice();
+    void createLogicalDevice();
+    uint32_t findComputeQueueFamily() const;
+    void createBuffer(VkBuffer& buffer, size_t size) const;
+    void destroyDebugMessenger();
     
     VkInstance m_instance;
     VkDebugUtilsMessengerEXT m_debugMessenger;
+    VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
+    VkDevice m_device;
+    VkQueue m_computeQueue;
+    VkBuffer m_buffer;
 };
 
 const std::vector<const char*> ValidationLayers = {
@@ -94,7 +105,86 @@ void ApplicationImpl::setupDebugMessenger() {
     EXCEPTION("Error getting pointer to vkCreateDebugUtilsMessengerEXT()");
   }
   VK_CHECK(func(m_instance, &createInfo, nullptr, &m_debugMessenger),
-           "Error setting up debug messenger");
+    "Error setting up debug messenger");
+}
+
+void ApplicationImpl::pickPhysicalDevice() {
+  uint32_t deviceCount = 0;
+  VK_CHECK(vkEnumeratePhysicalDevices(m_instance, &deviceCount, nullptr),
+    "Failed to enumerate physical devices");
+
+  if (deviceCount == 0) {
+    EXCEPTION("No physical devices found");
+  }
+
+  std::vector<VkPhysicalDevice> devices(deviceCount);
+  VK_CHECK(vkEnumeratePhysicalDevices(m_instance, &deviceCount, devices.data()),
+    "Failed to enumerate physical devices");
+
+  m_physicalDevice = devices[0];
+}
+
+uint32_t ApplicationImpl::findComputeQueueFamily() const {
+  uint32_t queueFamilyCount = 0;
+  vkGetPhysicalDeviceQueueFamilyProperties(m_physicalDevice, &queueFamilyCount, nullptr);
+
+  std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+  vkGetPhysicalDeviceQueueFamilyProperties(m_physicalDevice, &queueFamilyCount,
+    queueFamilies.data());
+
+  for (uint32_t i = 0; i < queueFamilies.size(); ++i) {
+    if (queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+      return i;
+    }
+  }
+
+  EXCEPTION("Could not find compute queue family");
+}
+
+void ApplicationImpl::createLogicalDevice() {
+  VkDeviceQueueCreateInfo queueCreateInfo{};
+
+  queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+  queueCreateInfo.queueFamilyIndex = findComputeQueueFamily();
+  queueCreateInfo.queueCount = 1;
+  float queuePriority = 1;
+  queueCreateInfo.pQueuePriorities = &queuePriority;
+
+  VkPhysicalDeviceFeatures deviceFeatures{};
+
+  VkDeviceCreateInfo createInfo{};
+  createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+  createInfo.queueCreateInfoCount = 1;
+  createInfo.pQueueCreateInfos = &queueCreateInfo;
+  createInfo.pEnabledFeatures = &deviceFeatures;
+  createInfo.enabledExtensionCount = 0;
+
+#ifdef NDEBUG
+  createInfo.enabledLayerCount = 0;
+#else
+  createInfo.enabledLayerCount = ValidationLayers.size();
+  createInfo.ppEnabledLayerNames = ValidationLayers.data();
+#endif
+
+  VK_CHECK(vkCreateDevice(m_physicalDevice, &createInfo, nullptr, &m_device),
+           "Failed to create logical device");
+
+  vkGetDeviceQueue(m_device, queueCreateInfo.queueFamilyIndex, 0, &m_computeQueue);
+}
+
+void ApplicationImpl::createBuffer(VkBuffer& buffer, size_t size) const {
+  VkBufferCreateInfo bufferInfo{};
+  bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  bufferInfo.size = size;
+
+  bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                   | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+  bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+  if (vkCreateBuffer(m_device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS) {
+    EXCEPTION("Failed to create buffer");
+  }
 }
 
 void ApplicationImpl::createVulkanInstance() {
@@ -137,10 +227,30 @@ ApplicationImpl::ApplicationImpl() {
 #ifndef NDEBUG
   setupDebugMessenger();
 #endif
+  pickPhysicalDevice();
+  createLogicalDevice();
+
+  size_t bufferSize = 512;
+  createBuffer(m_buffer, bufferSize);
 }
 
 void ApplicationImpl::start() {
   // TODO
+}
+
+void ApplicationImpl::destroyDebugMessenger() {
+  auto func = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
+    vkGetInstanceProcAddr(m_instance, "vkDestroyDebugUtilsMessengerEXT"));
+  func(m_instance, m_debugMessenger, nullptr);
+}
+
+ApplicationImpl::~ApplicationImpl() {
+#ifndef NDEBUG
+  destroyDebugMessenger();
+#endif
+  vkDestroyBuffer(m_device, m_buffer, nullptr);
+  vkDestroyDevice(m_device, nullptr);
+  vkDestroyInstance(m_instance, nullptr);
 }
 
 ApplicationPtr createApplication() {
