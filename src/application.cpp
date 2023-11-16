@@ -11,6 +11,10 @@ namespace {
 const int VERSION_MAJOR = 0;
 const int VERSION_MINOR = 1;
 
+const std::vector<const char*> ValidationLayers = {
+  "VK_LAYER_KHRONOS_validation"
+};
+
 class ApplicationImpl : public Application {
   public:
     ApplicationImpl();
@@ -20,6 +24,12 @@ class ApplicationImpl : public Application {
     ~ApplicationImpl();
     
   private:
+    static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT,
+      VkDebugUtilsMessageTypeFlagsEXT, const VkDebugUtilsMessengerCallbackDataEXT* data, void*);
+
+    void checkValidationLayerSupport() const;
+    VkDebugUtilsMessengerCreateInfoEXT getDebugMessengerCreateInfo() const;
+    std::vector<const char*> getRequiredExtensions() const;
     void createVulkanInstance();
     void setupDebugMessenger();
     void pickPhysicalDevice();
@@ -36,11 +46,7 @@ class ApplicationImpl : public Application {
     VkBuffer m_buffer;
 };
 
-const std::vector<const char*> ValidationLayers = {
-  "VK_LAYER_KHRONOS_validation"
-};
-
-void checkValidationLayerSupport() {
+void ApplicationImpl::checkValidationLayerSupport() const {
   uint32_t layerCount;
   VK_CHECK(vkEnumerateInstanceLayerProperties(&layerCount, nullptr),
     "Failed to enumerate instance layer properties");
@@ -59,18 +65,18 @@ void checkValidationLayerSupport() {
   }
 }
 
-VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
-  VkDebugUtilsMessageSeverityFlagBitsEXT /*severity*/,
-  VkDebugUtilsMessageTypeFlagsEXT /*type*/,
+VKAPI_ATTR VkBool32 VKAPI_CALL ApplicationImpl::debugCallback(
+  VkDebugUtilsMessageSeverityFlagBitsEXT,
+  VkDebugUtilsMessageTypeFlagsEXT,
   const VkDebugUtilsMessengerCallbackDataEXT* data,
-  void* /*userData*/) {
+  void*) {
 
   std::cerr << "Validation layer: " << data->pMessage << std::endl;
 
   return VK_FALSE;
 }
 
-VkDebugUtilsMessengerCreateInfoEXT getDebugMessengerCreateInfo() {
+VkDebugUtilsMessengerCreateInfoEXT ApplicationImpl::getDebugMessengerCreateInfo() const {
   VkDebugUtilsMessengerCreateInfoEXT createInfo{};
   createInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
   createInfo.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT
@@ -84,7 +90,7 @@ VkDebugUtilsMessengerCreateInfoEXT getDebugMessengerCreateInfo() {
   return createInfo;
 }
 
-std::vector<const char*> getRequiredExtensions() {
+std::vector<const char*> ApplicationImpl::getRequiredExtensions() const {
   std::vector<const char*> extensions;
 
 #ifndef NDEBUG
@@ -92,8 +98,6 @@ std::vector<const char*> getRequiredExtensions() {
 #endif
 
   return extensions;
-}
-
 }
 
 void ApplicationImpl::setupDebugMessenger() {
@@ -167,7 +171,7 @@ void ApplicationImpl::createLogicalDevice() {
 #endif
 
   VK_CHECK(vkCreateDevice(m_physicalDevice, &createInfo, nullptr, &m_device),
-           "Failed to create logical device");
+    "Failed to create logical device");
 
   vkGetDeviceQueue(m_device, queueCreateInfo.queueFamilyIndex, 0, &m_computeQueue);
 }
@@ -251,6 +255,8 @@ ApplicationImpl::~ApplicationImpl() {
   vkDestroyBuffer(m_device, m_buffer, nullptr);
   vkDestroyDevice(m_device, nullptr);
   vkDestroyInstance(m_instance, nullptr);
+}
+
 }
 
 ApplicationPtr createApplication() {
