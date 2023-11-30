@@ -1,48 +1,37 @@
+#include "gpu.hpp"
+#include "exception.hpp"
+#include <vulkan/vulkan.h>
+#include <shaderc/shaderc.hpp>
 #include <iostream>
 #include <vector>
 #include <cstring>
 #include <algorithm>
-#include <fstream>
-#include <vulkan/vulkan.h>
-#include "application.hpp"
-#include "exception.hpp"
+#include <map>
+
+#define VK_CHECK(fnCall, msg) \
+  { \
+    VkResult code = fnCall; \
+    if (code != VK_SUCCESS) { \
+      EXCEPTION(msg << " (result: " << code << ")"); \
+    } \
+  }
 
 namespace {
-
-const int VERSION_MAJOR = 0;
-const int VERSION_MINOR = 1;
-
-const uint32_t WORKGROUP_SIZE = 16;
-
-using netfloat_t = float;
 
 const std::vector<const char*> ValidationLayers = {
   "VK_LAYER_KHRONOS_validation"
 };
 
-std::vector<char> readFile(const std::string& filename) {
-  std::ifstream fin(filename, std::ios::ate | std::ios::binary);
-
-  if (!fin.is_open()) {
-    EXCEPTION("Failed to open file " << filename);
-  }
-
-  size_t fileSize = fin.tellg();
-  std::vector<char> bytes(fileSize);
-
-  fin.seekg(0);
-  fin.read(bytes.data(), fileSize);
-
-  return bytes;
-}
-
-class ApplicationImpl : public Application {
+class Vulkan : public Gpu {
   public:
-    ApplicationImpl();
+    Vulkan();
 
-    void start() override;
+    ShaderHandle compileShader(const std::string& shaderSource);
+    void submitBuffer(const void* buffer, size_t bufferSize) override;
+    void executeShader(size_t shaderIndex, size_t numWorkgroups) override;
+    void retrieveBuffer(void* data) override;
 
-    ~ApplicationImpl();
+    ~Vulkan();
 
   private:
     static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT,
@@ -59,30 +48,34 @@ class ApplicationImpl : public Application {
     void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size);
     void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
       VkBuffer& buffer, VkDeviceMemory& bufferMemory) const;
-    void createComputeBuffer();
     void createDescriptorSetLayout();
-    void createComputePipeline();
+    void createPipelineLayout();
     void createCommandPool();
     void createDescriptorPool();
     void createDescriptorSets();
     void createCommandBuffer();
-    void recordCommandBuffer(VkCommandBuffer commandBuffer);
+    void recordCommandBuffer(VkCommandBuffer commandBuffer, size_t numWorkgroups);
     void createSyncObjects();
     void destroyDebugMessenger();
-    VkShaderModule createShaderModule(const std::vector<char>& code) const;
-    void doWork();
+    void destroyBuffer();
+    void destroyStagingBuffer();
+    VkShaderModule createShaderModule(const std::string& source) const;
+    inline VkPipeline currentPipeline() const;
 
-    std::vector<netfloat_t> m_data;
     VkInstance m_instance;
     VkDebugUtilsMessengerEXT m_debugMessenger;
-    VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
+    VkPhysicalDevice m_physicalDevice;
     VkDevice m_device;
     VkQueue m_computeQueue;
     VkBuffer m_buffer;
     VkDeviceMemory m_bufferMemory;
+    VkDeviceSize m_bufferSize;
+    VkBuffer m_stagingBuffer;
+    VkDeviceMemory m_stagingBufferMemory;
     VkDescriptorSetLayout m_descriptorSetLayout;
     VkPipelineLayout m_pipelineLayout;
-    VkPipeline m_pipeline;
+    std::vector<VkPipeline> m_pipelines;
+    size_t m_currentPipelineIdx;
     VkCommandPool m_commandPool;
     VkCommandBuffer m_commandBuffer;
     VkDescriptorPool m_descriptorPool;
@@ -90,7 +83,147 @@ class ApplicationImpl : public Application {
     VkFence m_taskCompleteFence;
 };
 
-void ApplicationImpl::checkValidationLayerSupport() const {
+Vulkan::Vulkan()
+  : m_buffer(VK_NULL_HANDLE)
+  , m_bufferMemory(VK_NULL_HANDLE)
+  , m_bufferSize(0)
+  , m_stagingBuffer(VK_NULL_HANDLE)
+  , m_stagingBufferMemory(VK_NULL_HANDLE) {
+
+  createVulkanInstance();
+#ifndef NDEBUG
+  setupDebugMessenger();
+#endif
+  pickPhysicalDevice();
+  createLogicalDevice();
+  createDescriptorSetLayout();
+  createPipelineLayout();
+  createCommandPool();
+  createDescriptorPool();
+  createCommandBuffer();
+  createSyncObjects();
+}
+
+void Vulkan::destroyBuffer() {
+    vkDestroyBuffer(m_device, m_buffer, nullptr);
+    vkFreeMemory(m_device, m_bufferMemory, nullptr);
+    m_buffer = VK_NULL_HANDLE;
+    m_bufferMemory = VK_NULL_HANDLE;
+    m_bufferSize = 0;
+}
+
+void Vulkan::destroyStagingBuffer() {
+  vkDestroyBuffer(m_device, m_stagingBuffer, nullptr);
+  vkFreeMemory(m_device, m_stagingBufferMemory, nullptr);
+  m_stagingBuffer = VK_NULL_HANDLE;
+  m_stagingBufferMemory = VK_NULL_HANDLE;
+}
+
+void Vulkan::submitBuffer(const void* data, size_t size) {
+  VK_CHECK(vkDeviceWaitIdle(m_device), "Error waiting for device to be idle");
+
+  if (m_buffer != VK_NULL_HANDLE) {
+    destroyBuffer();
+  }
+
+  if (m_stagingBuffer != VK_NULL_HANDLE) {
+    destroyStagingBuffer();
+  }
+
+  VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                              | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+                              | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+  createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, flags, m_stagingBuffer,
+    m_stagingBufferMemory);
+
+  void* stagingBufferMapped = nullptr;
+  vkMapMemory(m_device, m_stagingBufferMemory, 0, size, 0, &stagingBufferMapped);
+  memcpy(stagingBufferMapped, data, size);
+  vkUnmapMemory(m_device, m_stagingBufferMemory);
+
+  VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                           | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                           | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+  createBuffer(size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_buffer, m_bufferMemory);
+
+  copyBuffer(m_stagingBuffer, m_buffer, size);
+
+  m_bufferSize = size;
+
+  createDescriptorSets();
+}
+
+ShaderHandle Vulkan::compileShader(const std::string& shaderSource) {
+  VkShaderModule shaderModule = createShaderModule(shaderSource);
+
+  VkPipelineShaderStageCreateInfo shaderStageInfo{};
+  shaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  shaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  shaderStageInfo.module = shaderModule;
+  shaderStageInfo.pName = "main";
+
+  VkComputePipelineCreateInfo pipelineInfo{};
+  pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+  pipelineInfo.layout = m_pipelineLayout;
+  pipelineInfo.stage = shaderStageInfo;
+
+  VkPipeline pipeline = VK_NULL_HANDLE;
+
+  VK_CHECK(vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
+    &pipeline), "Failed to create compute pipeline");
+
+  vkDestroyShaderModule(m_device, shaderModule, nullptr);
+
+  m_pipelines.push_back(pipeline);
+
+  return m_pipelines.size() - 1;
+}
+
+void Vulkan::executeShader(size_t shaderIndex, size_t numWorkgroups) {
+  //VK_CHECK(vkDeviceWaitIdle(m_device), "Error waiting for device to be idle");
+
+  m_currentPipelineIdx = shaderIndex;
+
+  vkResetCommandBuffer(m_commandBuffer, 0);
+  recordCommandBuffer(m_commandBuffer, numWorkgroups);
+
+  VkSubmitInfo submitInfo{};
+  submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submitInfo.commandBufferCount = 1;
+  submitInfo.pCommandBuffers = &m_commandBuffer;
+
+  VK_CHECK(vkQueueSubmit(m_computeQueue, 1, &submitInfo, m_taskCompleteFence),
+    "Failed to submit compute command buffer");
+
+  VK_CHECK(vkWaitForFences(m_device, 1, &m_taskCompleteFence, VK_TRUE, UINT64_MAX),
+    "Error waiting for fence");
+
+  VK_CHECK(vkResetFences(m_device, 1, &m_taskCompleteFence), "Error resetting fence");
+}
+
+void Vulkan::retrieveBuffer(void* data) {
+//  VK_CHECK(vkDeviceWaitIdle(m_device), "Error waiting for device to be idle");
+
+  if (m_buffer == VK_NULL_HANDLE) {
+    EXCEPTION("Error retrieving buffer; Buffer has not been created yet");
+  }
+
+  DBG_ASSERT(m_stagingBuffer != VK_NULL_HANDLE);
+
+  copyBuffer(m_buffer, m_stagingBuffer, m_bufferSize);
+
+  void* stagingBufferMapped = nullptr;
+  vkMapMemory(m_device, m_stagingBufferMemory, 0, m_bufferSize, 0, &stagingBufferMapped);
+  memcpy(data, stagingBufferMapped, m_bufferSize);
+  vkUnmapMemory(m_device, m_stagingBufferMemory);
+}
+
+VkPipeline Vulkan::currentPipeline() const {
+  return m_pipelines.at(m_currentPipelineIdx);
+}
+
+void Vulkan::checkValidationLayerSupport() const {
   uint32_t layerCount;
   VK_CHECK(vkEnumerateInstanceLayerProperties(&layerCount, nullptr),
     "Failed to enumerate instance layer properties");
@@ -109,7 +242,7 @@ void ApplicationImpl::checkValidationLayerSupport() const {
   }
 }
 
-VKAPI_ATTR VkBool32 VKAPI_CALL ApplicationImpl::debugCallback(
+VKAPI_ATTR VkBool32 VKAPI_CALL Vulkan::debugCallback(
   VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT,
   const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
 
@@ -118,7 +251,7 @@ VKAPI_ATTR VkBool32 VKAPI_CALL ApplicationImpl::debugCallback(
   return VK_FALSE;
 }
 
-VkDebugUtilsMessengerCreateInfoEXT ApplicationImpl::getDebugMessengerCreateInfo() const {
+VkDebugUtilsMessengerCreateInfoEXT Vulkan::getDebugMessengerCreateInfo() const {
   VkDebugUtilsMessengerCreateInfoEXT createInfo{};
   createInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
   createInfo.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT
@@ -132,7 +265,7 @@ VkDebugUtilsMessengerCreateInfoEXT ApplicationImpl::getDebugMessengerCreateInfo(
   return createInfo;
 }
 
-std::vector<const char*> ApplicationImpl::getRequiredExtensions() const {
+std::vector<const char*> Vulkan::getRequiredExtensions() const {
   std::vector<const char*> extensions;
 
 #ifndef NDEBUG
@@ -142,7 +275,7 @@ std::vector<const char*> ApplicationImpl::getRequiredExtensions() const {
   return extensions;
 }
 
-void ApplicationImpl::setupDebugMessenger() {
+void Vulkan::setupDebugMessenger() {
   auto createInfo = getDebugMessengerCreateInfo();
 
   auto func = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
@@ -154,7 +287,7 @@ void ApplicationImpl::setupDebugMessenger() {
     "Error setting up debug messenger");
 }
 
-void ApplicationImpl::pickPhysicalDevice() {
+void Vulkan::pickPhysicalDevice() {
   uint32_t deviceCount = 0;
   VK_CHECK(vkEnumeratePhysicalDevices(m_instance, &deviceCount, nullptr),
     "Failed to enumerate physical devices");
@@ -170,7 +303,7 @@ void ApplicationImpl::pickPhysicalDevice() {
   m_physicalDevice = devices[0];
 }
 
-uint32_t ApplicationImpl::findComputeQueueFamily() const {
+uint32_t Vulkan::findComputeQueueFamily() const {
   uint32_t queueFamilyCount = 0;
   vkGetPhysicalDeviceQueueFamilyProperties(m_physicalDevice, &queueFamilyCount, nullptr);
 
@@ -187,7 +320,7 @@ uint32_t ApplicationImpl::findComputeQueueFamily() const {
   EXCEPTION("Could not find compute queue family");
 }
 
-void ApplicationImpl::createLogicalDevice() {
+void Vulkan::createLogicalDevice() {
   VkDeviceQueueCreateInfo queueCreateInfo{};
 
   queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -218,7 +351,7 @@ void ApplicationImpl::createLogicalDevice() {
   vkGetDeviceQueue(m_device, queueCreateInfo.queueFamilyIndex, 0, &m_computeQueue);
 }
 
-void ApplicationImpl::copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
+void Vulkan::copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
   VkCommandBufferAllocateInfo allocInfo{};
   allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
   allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -253,7 +386,7 @@ void ApplicationImpl::copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDevic
   vkFreeCommandBuffers(m_device, m_commandPool, 1, &commandBuffer);
 }
 
-void ApplicationImpl::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
+void Vulkan::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
   VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory) const {
 
   VkBufferCreateInfo bufferInfo{};
@@ -294,34 +427,7 @@ void ApplicationImpl::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
   vkBindBufferMemory(m_device, buffer, bufferMemory, 0);
 }
 
-void ApplicationImpl::createComputeBuffer() {
-  // TODO: Do we really need a staging buffer?
-
-  VkDeviceSize size = m_data.size() * sizeof(netfloat_t);
-
-  VkBuffer stagingBuffer;
-  VkDeviceMemory stagingBufferMemory;
-  createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-    stagingBuffer, stagingBufferMemory);
-
-  void* bufferData = nullptr;
-  vkMapMemory(m_device, stagingBufferMemory, 0, size, 0, &bufferData);
-  memcpy(bufferData, m_data.data(), m_data.size() * sizeof(netfloat_t));
-  vkUnmapMemory(m_device, stagingBufferMemory);
-
-  VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT
-                           | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
-                           | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-  createBuffer(size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_buffer, m_bufferMemory);
-
-  copyBuffer(stagingBuffer, m_buffer, size);
-
-  vkDestroyBuffer(m_device, stagingBuffer, nullptr);
-  vkFreeMemory(m_device, stagingBufferMemory, nullptr);
-}
-
-void ApplicationImpl::createVulkanInstance() {
+void Vulkan::createVulkanInstance() {
 #ifndef NDEBUG
   checkValidationLayerSupport();
 #endif
@@ -329,9 +435,9 @@ void ApplicationImpl::createVulkanInstance() {
   VkApplicationInfo appInfo{};
   appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
   appInfo.pApplicationName = "Vulkan Compute Examples";
-  appInfo.applicationVersion = VK_MAKE_VERSION(VERSION_MAJOR, VERSION_MINOR, 0);
+  appInfo.applicationVersion = VK_MAKE_API_VERSION(1, 0, 0, 0);
   appInfo.pEngineName = "No Engine";
-  appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+  appInfo.engineVersion = VK_MAKE_API_VERSION(1, 0, 0, 0);
   appInfo.apiVersion = VK_API_VERSION_1_0;
 
   VkInstanceCreateInfo createInfo{};
@@ -356,7 +462,7 @@ void ApplicationImpl::createVulkanInstance() {
   VK_CHECK(vkCreateInstance(&createInfo, nullptr, &m_instance), "Failed to create instance");
 }
 
-void ApplicationImpl::createCommandPool() {
+void Vulkan::createCommandPool() {
   VkCommandPoolCreateInfo poolInfo{};
   poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
   poolInfo.queueFamilyIndex = findComputeQueueFamily();
@@ -366,7 +472,7 @@ void ApplicationImpl::createCommandPool() {
     "Failed to create command pool");
 }
 
-void ApplicationImpl::createCommandBuffer() {
+void Vulkan::createCommandBuffer() {
   VkCommandBufferAllocateInfo allocInfo{};
   allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
   allocInfo.commandPool = m_commandPool;
@@ -377,11 +483,23 @@ void ApplicationImpl::createCommandBuffer() {
     "Failed to allocate command buffer");
 }
 
-VkShaderModule ApplicationImpl::createShaderModule(const std::vector<char>& code) const {
+VkShaderModule Vulkan::createShaderModule(const std::string& source) const {
+  shaderc::Compiler compiler;
+  shaderc::CompileOptions options;
+  auto result = compiler.CompileGlslToSpv(source, shaderc_shader_kind::shaderc_glsl_compute_shader,
+    "shader", options);
+
+  if (result.GetCompilationStatus() != shaderc_compilation_status_success) {
+    EXCEPTION("Error compiling shader: " << result.GetErrorMessage());
+  }
+
+  std::vector<uint32_t> code;
+  code.assign(result.cbegin(), result.cend());
+
   VkShaderModuleCreateInfo createInfo{};
   createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-  createInfo.codeSize = code.size();
-  createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
+  createInfo.codeSize = code.size() * sizeof(uint32_t);
+  createInfo.pCode = code.data();
 
   VkShaderModule shaderModule;
   VK_CHECK(vkCreateShaderModule(m_device, &createInfo, nullptr, &shaderModule),
@@ -390,7 +508,7 @@ VkShaderModule ApplicationImpl::createShaderModule(const std::vector<char>& code
   return shaderModule;
 }
 
-void ApplicationImpl::createDescriptorSetLayout() {
+void Vulkan::createDescriptorSetLayout() {
   VkDescriptorSetLayoutBinding layoutBinding{};
   layoutBinding.binding = 0;
   layoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -407,7 +525,7 @@ void ApplicationImpl::createDescriptorSetLayout() {
     "Failed to create descriptor set layout");
 }
 
-void ApplicationImpl::createDescriptorPool() {
+void Vulkan::createDescriptorPool() {
   VkDescriptorPoolSize poolSize{};
   poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   poolSize.descriptorCount = 1;
@@ -422,7 +540,7 @@ void ApplicationImpl::createDescriptorPool() {
     "Failed to create descriptor pool");
 }
 
-void ApplicationImpl::createDescriptorSets() {
+void Vulkan::createDescriptorSets() {
   VkDescriptorSetAllocateInfo allocInfo{};
   allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
   allocInfo.descriptorPool = m_descriptorPool;
@@ -435,7 +553,7 @@ void ApplicationImpl::createDescriptorSets() {
   VkDescriptorBufferInfo bufferInfo{};
   bufferInfo.buffer = m_buffer;
   bufferInfo.offset = 0;
-  bufferInfo.range = m_data.size() * sizeof(netfloat_t);
+  bufferInfo.range = m_bufferSize;
 
   VkWriteDescriptorSet descriptorWrite{};
   descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -451,17 +569,7 @@ void ApplicationImpl::createDescriptorSets() {
   vkUpdateDescriptorSets(m_device, 1, &descriptorWrite, 0, nullptr);
 }
 
-void ApplicationImpl::createComputePipeline() {
-  auto shaderCode = readFile("shaders/shader.spv");
-  
-  VkShaderModule shaderModule = createShaderModule(shaderCode);
-  
-  VkPipelineShaderStageCreateInfo shaderStageInfo{};
-  shaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-  shaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-  shaderStageInfo.module = shaderModule;
-  shaderStageInfo.pName = "main";
-
+void Vulkan::createPipelineLayout() { 
   VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
   pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   pipelineLayoutInfo.setLayoutCount = 1;
@@ -470,41 +578,9 @@ void ApplicationImpl::createComputePipeline() {
   pipelineLayoutInfo.pPushConstantRanges = nullptr;
   VK_CHECK(vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout),
     "Failed to create pipeline layout");
-
-  VkComputePipelineCreateInfo pipelineInfo{};
-  pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-  pipelineInfo.layout = m_pipelineLayout;
-  pipelineInfo.stage = shaderStageInfo;
-  
-  VK_CHECK(vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
-    &m_pipeline), "Failed to create compute pipeline");
-    
-  vkDestroyShaderModule(m_device, shaderModule, nullptr);
 }
 
-ApplicationImpl::ApplicationImpl() {
-  m_data = std::vector<netfloat_t>{
-    1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8,   // Inputs
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0    // Outputs
-  };
-
-  createVulkanInstance();
-#ifndef NDEBUG
-  setupDebugMessenger();
-#endif
-  pickPhysicalDevice();
-  createLogicalDevice();
-  createDescriptorSetLayout();
-  createComputePipeline();
-  createCommandPool();
-  createComputeBuffer();
-  createDescriptorPool();
-  createDescriptorSets();
-  createCommandBuffer();
-  createSyncObjects();
-}
-
-void ApplicationImpl::recordCommandBuffer(VkCommandBuffer commandBuffer) {
+void Vulkan::recordCommandBuffer(VkCommandBuffer commandBuffer, size_t numWorkgroups) {
   VkCommandBufferBeginInfo beginInfo{};
   beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   beginInfo.flags = 0;
@@ -513,17 +589,15 @@ void ApplicationImpl::recordCommandBuffer(VkCommandBuffer commandBuffer) {
   VK_CHECK(vkBeginCommandBuffer(commandBuffer, &beginInfo),
     "Failed to begin recording command buffer");
 
-  size_t inputSize = m_data.size() / 2;
-
-  vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipeline);
+  vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, currentPipeline());
   vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1,
     &m_descriptorSet, 0, 0);
-  vkCmdDispatch(commandBuffer, inputSize / WORKGROUP_SIZE, 1, 1);
+  vkCmdDispatch(commandBuffer, numWorkgroups, 1, 1);
 
   VK_CHECK(vkEndCommandBuffer(commandBuffer), "Failed to record command buffer");
 }
 
-void ApplicationImpl::createSyncObjects() {
+void Vulkan::createSyncObjects() {
   VkFenceCreateInfo fenceInfo{};
   fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
   fenceInfo.flags = 0;
@@ -532,70 +606,21 @@ void ApplicationImpl::createSyncObjects() {
     "Failed to create fence");
 }
 
-void ApplicationImpl::doWork() {
-  // TODO: Check maxComputeWorkGroupCount, maxComputeWorkGroupInvocations and
-  // maxComputeWorkGroupSize limits in VkPhysicalDeviceLimits
-
-  vkResetCommandBuffer(m_commandBuffer, 0);
-  recordCommandBuffer(m_commandBuffer);
-
-  VkSubmitInfo submitInfo{};
-  submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  submitInfo.commandBufferCount = 1;
-  submitInfo.pCommandBuffers = &m_commandBuffer;
-
-  VK_CHECK(vkQueueSubmit(m_computeQueue, 1, &submitInfo, m_taskCompleteFence),
-    "Failed to submit compute command buffer");
-
-  VK_CHECK(vkWaitForFences(m_device, 1, &m_taskCompleteFence, VK_TRUE, UINT64_MAX),
-    "Error waiting for fence");
-
-  VK_CHECK(vkResetFences(m_device, 1, &m_taskCompleteFence), "Error resetting fence");
-
-  VkDeviceSize size = m_data.size() * sizeof(netfloat_t);
-
-  VkBuffer stagingBuffer;
-  VkDeviceMemory stagingBufferMemory;
-  createBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-    stagingBuffer, stagingBufferMemory);
-
-  copyBuffer(m_buffer, stagingBuffer, size);
-
-  void* bufferData = nullptr;
-  vkMapMemory(m_device, stagingBufferMemory, 0, size, 0, &bufferData);
-  memcpy(m_data.data(), bufferData, m_data.size() * sizeof(netfloat_t));
-  vkUnmapMemory(m_device, stagingBufferMemory);
-
-  vkDestroyBuffer(m_device, stagingBuffer, nullptr);
-  vkFreeMemory(m_device, stagingBufferMemory, nullptr);
-
-  size_t outputOffset = m_data.size() / 2;
-  for (size_t i = outputOffset; i < m_data.size(); ++i) {
-    std::cout << m_data[i] << " ";
-  }
-  std::cout << std::endl;
-}
-
-void ApplicationImpl::start() {
-  doWork();
-
-  VK_CHECK(vkDeviceWaitIdle(m_device), "Error waiting for device to be idle");
-}
-
-void ApplicationImpl::destroyDebugMessenger() {
+void Vulkan::destroyDebugMessenger() {
   auto func = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
     vkGetInstanceProcAddr(m_instance, "vkDestroyDebugUtilsMessengerEXT"));
   func(m_instance, m_debugMessenger, nullptr);
 }
 
-ApplicationImpl::~ApplicationImpl() {
+Vulkan::~Vulkan() {
   vkDestroyFence(m_device, m_taskCompleteFence, nullptr);
   vkDestroyCommandPool(m_device, m_commandPool, nullptr);
-  vkDestroyPipeline(m_device, m_pipeline, nullptr);
+  for (VkPipeline pipeline : m_pipelines) {
+    vkDestroyPipeline(m_device, pipeline, nullptr);
+  }
   vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
-  vkDestroyBuffer(m_device, m_buffer, nullptr);
-  vkFreeMemory(m_device, m_bufferMemory, nullptr);
+  destroyBuffer();
+  destroyStagingBuffer();
   vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
   vkDestroyDescriptorSetLayout(m_device, m_descriptorSetLayout, nullptr);
 #ifndef NDEBUG
@@ -607,7 +632,6 @@ ApplicationImpl::~ApplicationImpl() {
 
 }
 
-ApplicationPtr createApplication() {
-  return std::make_unique<ApplicationImpl>();
+GpuPtr createGpu() {
+  return std::make_unique<Vulkan>();
 }
-
