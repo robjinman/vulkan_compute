@@ -28,8 +28,9 @@ class Vulkan : public Gpu {
 
     ShaderHandle compileShader(const std::string& source, const Size3& workgroupSize) override;
     void submitBuffer(const void* buffer, size_t bufferSize) override;
-    void executeShader(size_t shaderIndex) override;
+    void queueShader(size_t shaderIndex) override;
     void retrieveBuffer(void* data) override;
+    void flushQueue() override;
 
     ~Vulkan();
 
@@ -53,7 +54,7 @@ class Vulkan : public Gpu {
     void createCommandPool();
     void createDescriptorPool();
     void createDescriptorSets();
-    void createCommandBuffer();
+    VkCommandBuffer createCommandBuffer();
     void recordCommandBuffer(VkCommandBuffer commandBuffer, const Size3& numWorkgroups);
     void createSyncObjects();
     void destroyDebugMessenger();
@@ -77,7 +78,8 @@ class Vulkan : public Gpu {
     std::vector<VkPipeline> m_pipelines;
     size_t m_currentPipelineIdx;
     VkCommandPool m_commandPool;
-    VkCommandBuffer m_commandBuffer;
+    //VkCommandBuffer m_commandBuffer;
+    std::vector<VkCommandBuffer> m_commandBuffers;
     VkDescriptorPool m_descriptorPool;
     VkDescriptorSet m_descriptorSet;
     VkFence m_taskCompleteFence;
@@ -100,7 +102,7 @@ Vulkan::Vulkan()
   createPipelineLayout();
   createCommandPool();
   createDescriptorPool();
-  createCommandBuffer();
+  //createCommandBuffer();
   createSyncObjects();
 }
 
@@ -207,26 +209,35 @@ ShaderHandle Vulkan::compileShader(const std::string& source, const Size3& workg
   return m_pipelines.size() - 1;
 }
 
-void Vulkan::executeShader(size_t shaderIndex) {
+void Vulkan::queueShader(size_t shaderIndex) {
   //VK_CHECK(vkDeviceWaitIdle(m_device), "Error waiting for device to be idle");
 
   m_currentPipelineIdx = shaderIndex;
 
-  vkResetCommandBuffer(m_commandBuffer, 0);
-  recordCommandBuffer(m_commandBuffer, { 1, 1, 1 }); // TODO
+  VkCommandBuffer commandBuffer = createCommandBuffer();
+  m_commandBuffers.push_back(commandBuffer);
 
+  //vkResetCommandBuffer(commandBuffer, 0);
+  recordCommandBuffer(commandBuffer, { 1, 1, 1 }); // TODO
+}
+
+void Vulkan::flushQueue() {
   VkSubmitInfo submitInfo{};
   submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  submitInfo.commandBufferCount = 1;
-  submitInfo.pCommandBuffers = &m_commandBuffer;
+  submitInfo.commandBufferCount = m_commandBuffers.size();
+  submitInfo.pCommandBuffers = m_commandBuffers.data();
 
   VK_CHECK(vkQueueSubmit(m_computeQueue, 1, &submitInfo, m_taskCompleteFence),
     "Failed to submit compute command buffer");
+
+  // TODO: Remove fences?
 
   VK_CHECK(vkWaitForFences(m_device, 1, &m_taskCompleteFence, VK_TRUE, UINT64_MAX),
     "Error waiting for fence");
 
   VK_CHECK(vkResetFences(m_device, 1, &m_taskCompleteFence), "Error resetting fence");
+
+  m_commandBuffers.clear();
 }
 
 void Vulkan::retrieveBuffer(void* data) {
@@ -499,15 +510,19 @@ void Vulkan::createCommandPool() {
     "Failed to create command pool");
 }
 
-void Vulkan::createCommandBuffer() {
+VkCommandBuffer Vulkan::createCommandBuffer() {
   VkCommandBufferAllocateInfo allocInfo{};
   allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
   allocInfo.commandPool = m_commandPool;
   allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
   allocInfo.commandBufferCount = 1;
 
-  VK_CHECK(vkAllocateCommandBuffers(m_device, &allocInfo, &m_commandBuffer),
+  VkCommandBuffer commandBuffer;
+
+  VK_CHECK(vkAllocateCommandBuffers(m_device, &allocInfo, &commandBuffer),
     "Failed to allocate command buffer");
+
+  return commandBuffer;
 }
 
 VkShaderModule Vulkan::createShaderModule(const std::string& source) const {

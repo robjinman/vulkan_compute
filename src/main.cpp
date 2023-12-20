@@ -57,8 +57,10 @@ int main() {
 
   gpu->submitBuffer(data.data(), data.size() * sizeof(netfloat_t));
 
-  gpu->executeShader(shader1);
-  gpu->executeShader(shader2);
+  gpu->queueShader(shader1);
+  gpu->queueShader(shader2);
+
+  gpu->flushQueue();
 
   gpu->retrieveBuffer(data.data());
 
