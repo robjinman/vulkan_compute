@@ -3,14 +3,16 @@
 #include <string>
 #include <memory>
 #include <vector>
+#include <array>
 
 using ShaderHandle = size_t;
+using Size3 = const std::array<uint32_t, 3>;
 
 class Gpu {
   public:
-    virtual ShaderHandle compileShader(const std::string& source) = 0;
+    virtual ShaderHandle compileShader(const std::string& source, const Size3& workgroupSize) = 0;
     virtual void submitBuffer(const void* buffer, size_t bufferSize) = 0;
-    virtual void executeShader(size_t shaderIndex, size_t numWorkgroups) = 0;
+    virtual void executeShader(size_t shaderIndex) = 0;
     virtual void retrieveBuffer(void* data) = 0;
 
     virtual ~Gpu() {}

@@ -18,8 +18,9 @@ void write(uint pos, float val) {
 }
 
 void main() {
-  const uint outputOffset = 16; // In floats
+  const uint inputOffset = 16; // In floats
+  const uint outputOffset = 0; // In floats
   const uint index = gl_GlobalInvocationID.x;
 
-  write(outputOffset + index, read(index) * 2.0);
+  write(outputOffset + index, read(inputOffset + index) * 2.0);
 }
