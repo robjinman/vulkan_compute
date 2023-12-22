@@ -22,14 +22,30 @@ const std::vector<const char*> ValidationLayers = {
   "VK_LAYER_KHRONOS_validation"
 };
 
+struct Buffer {
+  VkBuffer handle = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  VkDeviceSize size = 0;
+  VkDescriptorType type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+};
+
+struct Pipeline {
+  VkPipeline handle = VK_NULL_HANDLE;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
+  VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+};
+
 class Vulkan : public Gpu {
   public:
     Vulkan();
 
-    ShaderHandle compileShader(const std::string& source, const Size3& workgroupSize) override;
-    void submitBuffer(const void* buffer, size_t bufferSize) override;
-    void queueShader(size_t shaderIndex) override;
-    void retrieveBuffer(void* data) override;
+    ShaderHandle compileShader(const std::string& source,
+      const BufferBindings& bufferBindings, const Size3& workgroupSize) override;
+    BufferHandle allocateBuffer(size_t size, BufferFlags flags) override;
+    void submitBufferData(BufferHandle buffer, const void* data) override;
+    void queueShader(ShaderHandle shaderHandle) override;
+    void retrieveBuffer(BufferHandle buffer, void* data) override;
     void flushQueue() override;
 
     ~Vulkan();
@@ -49,17 +65,19 @@ class Vulkan : public Gpu {
     void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size);
     void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
       VkBuffer& buffer, VkDeviceMemory& bufferMemory) const;
-    void createDescriptorSetLayout();
-    void createPipelineLayout();
+    VkDescriptorSetLayout createDescriptorSetLayout(const BufferBindings& buffers);
+    VkPipelineLayout createPipelineLayout(VkDescriptorSetLayout descriptorSetLayout);
     void createCommandPool();
     void createDescriptorPool();
-    void createDescriptorSets();
+    VkDescriptorSet createDescriptorSet(const BufferBindings& buffers,
+      VkDescriptorSetLayout layout);
     VkCommandBuffer createCommandBuffer();
-    void recordCommandBuffer(VkCommandBuffer commandBuffer, const Size3& numWorkgroups);
+    void dispatchWorkgroups(VkCommandBuffer commandBuffer, size_t pipelineIdx,
+      const Size3& numWorkgroups);
     void createSyncObjects();
     void destroyDebugMessenger();
-    void destroyBuffer();
-    void destroyStagingBuffer();
+    void destroyBuffers();
+    //void destroyStagingBuffer();
     VkShaderModule createShaderModule(const std::string& source) const;
     inline VkPipeline currentPipeline() const;
 
@@ -68,69 +86,78 @@ class Vulkan : public Gpu {
     VkPhysicalDevice m_physicalDevice;
     VkDevice m_device;
     VkQueue m_computeQueue;
-    VkBuffer m_buffer;
-    VkDeviceMemory m_bufferMemory;
-    VkDeviceSize m_bufferSize;
-    VkBuffer m_stagingBuffer;
-    VkDeviceMemory m_stagingBufferMemory;
-    VkDescriptorSetLayout m_descriptorSetLayout;
-    VkPipelineLayout m_pipelineLayout;
-    std::vector<VkPipeline> m_pipelines;
-    size_t m_currentPipelineIdx;
+    std::vector<Buffer> m_buffers;
+    //VkBuffer m_stagingBuffer;
+    //VkDeviceMemory m_stagingBufferMemory;
+    //VkDescriptorSetLayout m_descriptorSetLayout;
+    //VkPipelineLayout m_pipelineLayout;
+    std::vector<Pipeline> m_pipelines;
+    size_t m_currentPipelineIdx; // TODO: Remove this?
     VkCommandPool m_commandPool;
     //VkCommandBuffer m_commandBuffer;
     std::vector<VkCommandBuffer> m_commandBuffers;
     VkDescriptorPool m_descriptorPool;
-    VkDescriptorSet m_descriptorSet;
+    //VkDescriptorSet m_descriptorSet;
     VkFence m_taskCompleteFence;
 };
 
-Vulkan::Vulkan()
-  : m_buffer(VK_NULL_HANDLE)
-  , m_bufferMemory(VK_NULL_HANDLE)
-  , m_bufferSize(0)
-  , m_stagingBuffer(VK_NULL_HANDLE)
-  , m_stagingBufferMemory(VK_NULL_HANDLE) {
-
+Vulkan::Vulkan() {
   createVulkanInstance();
 #ifndef NDEBUG
   setupDebugMessenger();
 #endif
   pickPhysicalDevice();
   createLogicalDevice();
-  createDescriptorSetLayout();
-  createPipelineLayout();
+  //createDescriptorSetLayout();
+  //createPipelineLayout();
   createCommandPool();
   createDescriptorPool();
   //createCommandBuffer();
   createSyncObjects();
 }
 
-void Vulkan::destroyBuffer() {
-    vkDestroyBuffer(m_device, m_buffer, nullptr);
-    vkFreeMemory(m_device, m_bufferMemory, nullptr);
-    m_buffer = VK_NULL_HANDLE;
-    m_bufferMemory = VK_NULL_HANDLE;
-    m_bufferSize = 0;
+void Vulkan::destroyBuffers() {
+  for (auto& buffer : m_buffers) {
+    vkDestroyBuffer(m_device, buffer.handle, nullptr);
+    vkFreeMemory(m_device, buffer.memory, nullptr);
+  }
+  m_buffers.clear();
 }
 
-void Vulkan::destroyStagingBuffer() {
-  vkDestroyBuffer(m_device, m_stagingBuffer, nullptr);
-  vkFreeMemory(m_device, m_stagingBufferMemory, nullptr);
-  m_stagingBuffer = VK_NULL_HANDLE;
-  m_stagingBufferMemory = VK_NULL_HANDLE;
-}
-
-void Vulkan::submitBuffer(const void* data, size_t size) {
+BufferHandle Vulkan::allocateBuffer(size_t size, BufferFlags flags) {
+  // TODO: Remove
   VK_CHECK(vkDeviceWaitIdle(m_device), "Error waiting for device to be idle");
 
-  if (m_buffer != VK_NULL_HANDLE) {
-    destroyBuffer();
-  }
+  // TODO: Use flags arg
 
-  if (m_stagingBuffer != VK_NULL_HANDLE) {
-    destroyStagingBuffer();
-  }
+  Buffer buffer;
+
+  VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                           | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                           | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+  createBuffer(size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, buffer.handle, buffer.memory);
+
+  buffer.size = size;
+  buffer.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+
+  m_buffers.push_back(buffer);
+
+  // TODO: Can't just be an index if we allow buffer deletion
+  return m_buffers.size() - 1;
+
+  //createDescriptorSets();
+}
+
+void Vulkan::submitBufferData(BufferHandle bufferHandle, const void* data) {
+  // TODO: Remove
+  VK_CHECK(vkDeviceWaitIdle(m_device), "Error waiting for device to be idle");
+
+  // TODO: May not always need staging buffer
+
+  VkBuffer stagingBuffer;
+  VkDeviceMemory stagingBufferMemory;
+
+  Buffer& buffer = m_buffers[bufferHandle];
 
   VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
                               | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
@@ -138,26 +165,25 @@ void Vulkan::submitBuffer(const void* data, size_t size) {
 
   VkBufferUsageFlags stagingUsage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT
                                   | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-  createBuffer(size, stagingUsage, flags, m_stagingBuffer, m_stagingBufferMemory);
+  createBuffer(buffer.size, stagingUsage, flags, stagingBuffer, stagingBufferMemory);
 
   void* stagingBufferMapped = nullptr;
-  vkMapMemory(m_device, m_stagingBufferMemory, 0, size, 0, &stagingBufferMapped);
-  memcpy(stagingBufferMapped, data, size);
-  vkUnmapMemory(m_device, m_stagingBufferMemory);
+  vkMapMemory(m_device, stagingBufferMemory, 0, buffer.size, 0, &stagingBufferMapped);
+  memcpy(stagingBufferMapped, data, buffer.size);
+  vkUnmapMemory(m_device, stagingBufferMemory);
 
-  VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT
-                           | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
-                           | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-  createBuffer(size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_buffer, m_bufferMemory);
+  copyBuffer(stagingBuffer, buffer.handle, buffer.size);
+  flushQueue(); // TODO
 
-  copyBuffer(m_stagingBuffer, m_buffer, size);
+  vkFreeMemory(m_device, stagingBufferMemory, nullptr);
+  vkDestroyBuffer(m_device, stagingBuffer, nullptr);
 
-  m_bufferSize = size;
-
-  createDescriptorSets();
+  //createDescriptorSets();
 }
 
-ShaderHandle Vulkan::compileShader(const std::string& source, const Size3& workgroupSize) {
+ShaderHandle Vulkan::compileShader(const std::string& source, const BufferBindings& bufferBindings,
+  const Size3& workgroupSize) {
+
   VkShaderModule shaderModule = createShaderModule(source);
 
   const VkSpecializationMapEntry entries[] = {
@@ -185,6 +211,10 @@ ShaderHandle Vulkan::compileShader(const std::string& source, const Size3& workg
     .pData = workgroupSize.data()
   };
 
+  Pipeline pipeline;
+  pipeline.descriptorSetLayout = createDescriptorSetLayout(bufferBindings);
+  pipeline.layout = createPipelineLayout(pipeline.descriptorSetLayout);
+
   VkPipelineShaderStageCreateInfo shaderStageInfo{};
   shaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
   shaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -194,34 +224,41 @@ ShaderHandle Vulkan::compileShader(const std::string& source, const Size3& workg
 
   VkComputePipelineCreateInfo pipelineInfo{};
   pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-  pipelineInfo.layout = m_pipelineLayout;
+  pipelineInfo.layout = pipeline.layout;
   pipelineInfo.stage = shaderStageInfo;
 
-  VkPipeline pipeline = VK_NULL_HANDLE;
-
   VK_CHECK(vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
-    &pipeline), "Failed to create compute pipeline");
+    &pipeline.handle), "Failed to create compute pipeline");
 
   vkDestroyShaderModule(m_device, shaderModule, nullptr);
+
+  pipeline.descriptorSet = createDescriptorSet(bufferBindings, pipeline.descriptorSetLayout);
 
   m_pipelines.push_back(pipeline);
 
   return m_pipelines.size() - 1;
 }
 
-void Vulkan::queueShader(size_t shaderIndex) {
-  //VK_CHECK(vkDeviceWaitIdle(m_device), "Error waiting for device to be idle");
-
-  m_currentPipelineIdx = shaderIndex;
+void Vulkan::queueShader(ShaderHandle shaderHandle) {
+  // TODO: Remove
+  VK_CHECK(vkDeviceWaitIdle(m_device), "Error waiting for device to be idle");
 
   VkCommandBuffer commandBuffer = createCommandBuffer();
   m_commandBuffers.push_back(commandBuffer);
 
   //vkResetCommandBuffer(commandBuffer, 0);
-  recordCommandBuffer(commandBuffer, { 1, 1, 1 }); // TODO
+  dispatchWorkgroups(commandBuffer, shaderHandle, { 1, 1, 1 }); // TODO
+
+  flushQueue();
+    // TODO: Remove
+  VK_CHECK(vkDeviceWaitIdle(m_device), "Error waiting for device to be idle");
 }
 
 void Vulkan::flushQueue() {
+  if (m_commandBuffers.empty()) {
+    return;
+  }
+
   VkSubmitInfo submitInfo{};
   submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   submitInfo.commandBufferCount = m_commandBuffers.size();
@@ -237,28 +274,37 @@ void Vulkan::flushQueue() {
 
   VK_CHECK(vkResetFences(m_device, 1, &m_taskCompleteFence), "Error resetting fence");
 
+  vkFreeCommandBuffers(m_device, m_commandPool, m_commandBuffers.size(), m_commandBuffers.data());
   m_commandBuffers.clear();
 }
 
-void Vulkan::retrieveBuffer(void* data) {
-//  VK_CHECK(vkDeviceWaitIdle(m_device), "Error waiting for device to be idle");
+void Vulkan::retrieveBuffer(BufferHandle bufIdx, void* data) {
+  // TODO: Remove
+  VK_CHECK(vkDeviceWaitIdle(m_device), "Error waiting for device to be idle");
 
-  if (m_buffer == VK_NULL_HANDLE) {
-    EXCEPTION("Error retrieving buffer; Buffer has not been created yet");
-  }
+  Buffer& buffer = m_buffers[bufIdx];
 
-  DBG_ASSERT(m_stagingBuffer != VK_NULL_HANDLE);
+  VkBuffer stagingBuffer;
+  VkDeviceMemory stagingBufferMemory;
 
-  copyBuffer(m_buffer, m_stagingBuffer, m_bufferSize);
+  VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                              | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+                              | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+  VkBufferUsageFlags stagingUsage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                                  | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  createBuffer(buffer.size, stagingUsage, flags, stagingBuffer, stagingBufferMemory);
+
+  copyBuffer(buffer.handle, stagingBuffer, buffer.size);
+  flushQueue(); // TODO
 
   void* stagingBufferMapped = nullptr;
-  vkMapMemory(m_device, m_stagingBufferMemory, 0, m_bufferSize, 0, &stagingBufferMapped);
-  memcpy(data, stagingBufferMapped, m_bufferSize);
-  vkUnmapMemory(m_device, m_stagingBufferMemory);
-}
+  vkMapMemory(m_device, stagingBufferMemory, 0, buffer.size, 0, &stagingBufferMapped);
+  memcpy(data, stagingBufferMapped, buffer.size);
+  vkUnmapMemory(m_device, stagingBufferMemory);
 
-VkPipeline Vulkan::currentPipeline() const {
-  return m_pipelines.at(m_currentPipelineIdx);
+  vkFreeMemory(m_device, stagingBufferMemory, nullptr);
+  vkDestroyBuffer(m_device, stagingBuffer, nullptr);
 }
 
 void Vulkan::checkValidationLayerSupport() const {
@@ -390,38 +436,23 @@ void Vulkan::createLogicalDevice() {
 }
 
 void Vulkan::copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
-  VkCommandBufferAllocateInfo allocInfo{};
-  allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-  allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  allocInfo.commandPool = m_commandPool; // TODO: Separate pool for temp buffers?
-  allocInfo.commandBufferCount = 1;
-  
-  VkCommandBuffer commandBuffer;
-  vkAllocateCommandBuffers(m_device, &allocInfo, &commandBuffer);
-  
+  VkCommandBuffer commandBuffer = createCommandBuffer();
+
   VkCommandBufferBeginInfo beginInfo{};
   beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
   vkBeginCommandBuffer(commandBuffer, &beginInfo);
-  
+
   VkBufferCopy copyRegion{};
   copyRegion.srcOffset = 0;
   copyRegion.dstOffset = 0;
   copyRegion.size = size;
   vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
-  
+
   vkEndCommandBuffer(commandBuffer);
 
-  VkSubmitInfo submitInfo{};
-  submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  submitInfo.commandBufferCount = 1;
-  submitInfo.pCommandBuffers = &commandBuffer;
-  
-  vkQueueSubmit(m_computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
-  vkQueueWaitIdle(m_computeQueue); // Use fence if doing multiple transfers simultaneously
-  
-  vkFreeCommandBuffers(m_device, m_commandPool, 1, &commandBuffer);
+  m_commandBuffers.push_back(commandBuffer);
 }
 
 void Vulkan::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
@@ -550,79 +581,114 @@ VkShaderModule Vulkan::createShaderModule(const std::string& source) const {
   return shaderModule;
 }
 
-void Vulkan::createDescriptorSetLayout() {
-  VkDescriptorSetLayoutBinding layoutBinding{};
-  layoutBinding.binding = 0;
-  layoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  layoutBinding.descriptorCount = 1;
-  layoutBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-  layoutBinding.pImmutableSamplers = nullptr;
+VkDescriptorSetLayout Vulkan::createDescriptorSetLayout(const BufferBindings& buffers) {
+  std::vector<VkDescriptorSetLayoutBinding> bindings;
+
+  for (uint32_t slot = 0; slot < buffers.size(); ++slot) {
+    BufferHandle index = buffers[slot];
+    const Buffer& buffer = m_buffers[index];
+
+    VkDescriptorSetLayoutBinding binding{};
+    binding.binding = slot;
+    binding.descriptorType = buffer.type;
+    binding.descriptorCount = 1;  // TODO: Support arrays of buffers
+    binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    binding.pImmutableSamplers = nullptr;
+
+    bindings.push_back(binding);
+  }
 
   VkDescriptorSetLayoutCreateInfo layoutInfo{};
   layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  layoutInfo.bindingCount = 1;
-  layoutInfo.pBindings = &layoutBinding;
-  
-  VK_CHECK(vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_descriptorSetLayout),
+  layoutInfo.bindingCount = bindings.size();
+  layoutInfo.pBindings = bindings.data();
+
+  VkDescriptorSetLayout layout;
+
+  VK_CHECK(vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &layout),
     "Failed to create descriptor set layout");
+
+  return layout;
 }
 
 void Vulkan::createDescriptorPool() {
   VkDescriptorPoolSize poolSize{};
   poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  poolSize.descriptorCount = 1;
+  poolSize.descriptorCount = 16; // TODO
 
   VkDescriptorPoolCreateInfo poolInfo{};
   poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   poolInfo.poolSizeCount = 1;
   poolInfo.pPoolSizes = &poolSize;
-  poolInfo.maxSets = 1;
+  poolInfo.maxSets = 4; // TODO
 
   VK_CHECK(vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_descriptorPool),
     "Failed to create descriptor pool");
 }
 
-void Vulkan::createDescriptorSets() {
+VkDescriptorSet Vulkan::createDescriptorSet(const BufferBindings& buffers,
+  VkDescriptorSetLayout layout) {
+
   VkDescriptorSetAllocateInfo allocInfo{};
   allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
   allocInfo.descriptorPool = m_descriptorPool;
   allocInfo.descriptorSetCount = 1;
-  allocInfo.pSetLayouts = &m_descriptorSetLayout;
+  allocInfo.pSetLayouts = &layout;
 
-  VK_CHECK(vkAllocateDescriptorSets(m_device, &allocInfo, &m_descriptorSet),
+  VkDescriptorSet descriptorSet;
+
+  VK_CHECK(vkAllocateDescriptorSets(m_device, &allocInfo, &descriptorSet),
     "Failed to allocate descriptor set");
 
-  VkDescriptorBufferInfo bufferInfo{};
-  bufferInfo.buffer = m_buffer;
-  bufferInfo.offset = 0;
-  bufferInfo.range = m_bufferSize;
+  std::vector<VkDescriptorBufferInfo> bufferInfos(buffers.size());
+  std::vector<VkWriteDescriptorSet> descriptorWrites(buffers.size());
 
-  VkWriteDescriptorSet descriptorWrite{};
-  descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-  descriptorWrite.dstSet = m_descriptorSet;
-  descriptorWrite.dstBinding = 0;
-  descriptorWrite.dstArrayElement = 0;
-  descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  descriptorWrite.descriptorCount = 1;
-  descriptorWrite.pBufferInfo = &bufferInfo;
-  descriptorWrite.pImageInfo = nullptr;
-  descriptorWrite.pTexelBufferView = nullptr;
+  for (size_t slot = 0; slot < buffers.size(); ++slot) {
+    BufferHandle bufIdx = buffers[slot];
+    const Buffer& buffer = m_buffers[bufIdx];
 
-  vkUpdateDescriptorSets(m_device, 1, &descriptorWrite, 0, nullptr);
+    auto& bufferInfo = bufferInfos[slot];
+    bufferInfo.buffer = buffer.handle;
+    bufferInfo.offset = 0;
+    bufferInfo.range = buffer.size;
+
+    auto& descriptorWrite = descriptorWrites[slot];
+    descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    descriptorWrite.dstSet = descriptorSet;
+    descriptorWrite.dstBinding = slot;
+    descriptorWrite.dstArrayElement = 0;
+    descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; // TODO: Support UBOs
+    descriptorWrite.descriptorCount = 1;
+    descriptorWrite.pBufferInfo = &bufferInfo;
+    descriptorWrite.pImageInfo = nullptr;
+    descriptorWrite.pTexelBufferView = nullptr;
+  }
+
+  vkUpdateDescriptorSets(m_device, descriptorWrites.size(), descriptorWrites.data(), 0, nullptr);
+
+  return descriptorSet;
 }
 
-void Vulkan::createPipelineLayout() { 
+VkPipelineLayout Vulkan::createPipelineLayout(VkDescriptorSetLayout descriptorSetLayout) {
+  VkPipelineLayout pipelineLayout;
+
   VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
   pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   pipelineLayoutInfo.setLayoutCount = 1;
-  pipelineLayoutInfo.pSetLayouts = &m_descriptorSetLayout;
-  pipelineLayoutInfo.pushConstantRangeCount = 0;
+  pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;
+  pipelineLayoutInfo.pushConstantRangeCount = 0;  // TODO: Support push constants
   pipelineLayoutInfo.pPushConstantRanges = nullptr;
-  VK_CHECK(vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout),
+  VK_CHECK(vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &pipelineLayout),
     "Failed to create pipeline layout");
+
+  return pipelineLayout;
 }
 
-void Vulkan::recordCommandBuffer(VkCommandBuffer commandBuffer, const Size3& numWorkgroups) {
+void Vulkan::dispatchWorkgroups(VkCommandBuffer commandBuffer, size_t pipelineIdx,
+  const Size3& numWorkgroups) {
+
+  const Pipeline& pipeline = m_pipelines[pipelineIdx];
+
   VkCommandBufferBeginInfo beginInfo{};
   beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   beginInfo.flags = 0;
@@ -631,9 +697,9 @@ void Vulkan::recordCommandBuffer(VkCommandBuffer commandBuffer, const Size3& num
   VK_CHECK(vkBeginCommandBuffer(commandBuffer, &beginInfo),
     "Failed to begin recording command buffer");
 
-  vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, currentPipeline());
-  vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1,
-    &m_descriptorSet, 0, 0);
+  vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
+  vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1,
+    &pipeline.descriptorSet, 0, 0);
   vkCmdDispatch(commandBuffer, numWorkgroups[0], numWorkgroups[1], numWorkgroups[2]);
 
   VK_CHECK(vkEndCommandBuffer(commandBuffer), "Failed to record command buffer");
@@ -657,14 +723,15 @@ void Vulkan::destroyDebugMessenger() {
 Vulkan::~Vulkan() {
   vkDestroyFence(m_device, m_taskCompleteFence, nullptr);
   vkDestroyCommandPool(m_device, m_commandPool, nullptr);
-  for (VkPipeline pipeline : m_pipelines) {
-    vkDestroyPipeline(m_device, pipeline, nullptr);
+  for (const auto& pipeline : m_pipelines) {
+    vkDestroyPipeline(m_device, pipeline.handle, nullptr);
+    vkDestroyPipelineLayout(m_device, pipeline.layout, nullptr);
+  vkDestroyDescriptorSetLayout(m_device, pipeline.descriptorSetLayout, nullptr);
   }
-  vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
-  destroyBuffer();
-  destroyStagingBuffer();
+  destroyBuffers();
+  //destroyStagingBuffer();
   vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
-  vkDestroyDescriptorSetLayout(m_device, m_descriptorSetLayout, nullptr);
+  //vkDestroyDescriptorSetLayout(m_device, m_descriptorSetLayout, nullptr);
 #ifndef NDEBUG
   destroyDebugMessenger();
 #endif

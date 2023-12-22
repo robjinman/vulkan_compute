@@ -39,42 +39,53 @@ Large, device local, need staging buffer
 
 */
 
+void printBuffer(const std::vector<netfloat_t>& buffer) {
+  for (size_t i = 0; i < buffer.size(); ++i) {
+    std::cout << buffer[i] << " ";
+  }
+  std::cout << std::endl;
+}
+
 int main() {
   GpuPtr gpu = createGpu();
 
-  std::vector<netfloat_t> data{
-    1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8,   // Inputs
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0    // Outputs
+  std::vector<netfloat_t> bufferAData{
+    1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8
   };
 
-  std::string shader1Source = loadFile("shaders/shader.glsl");
-  ShaderHandle shader1 = gpu->compileShader(shader1Source, { 16, 1, 1 });
+  std::vector<netfloat_t> bufferBData(bufferAData.size());
 
-  std::string shader2Source = loadFile("shaders/shader2.glsl");
-  ShaderHandle shader2 = gpu->compileShader(shader2Source, { 16, 1, 1 });
+  BufferHandle bufferA = gpu->allocateBuffer(bufferAData.size() * sizeof(netfloat_t), 0);
+  BufferHandle bufferB = gpu->allocateBuffer(bufferBData.size() * sizeof(netfloat_t), 0);
+
+  std::string shader1Source = loadFile("shaders/shader.glsl");
+  ShaderHandle shader1 = gpu->compileShader(shader1Source, { bufferA, bufferB }, { 16, 1, 1 });
+
+  //std::string shader2Source = loadFile("shaders/shader2.glsl");
+  //ShaderHandle shader2 = gpu->compileShader(shader2Source, { 16, 1, 1 });
 
   auto startTime = std::chrono::high_resolution_clock::now();
 
-  gpu->submitBuffer(data.data(), data.size() * sizeof(netfloat_t));
+  gpu->submitBufferData(bufferA, bufferAData.data());
 
   gpu->queueShader(shader1);
-  gpu->queueShader(shader2);
+  //gpu->queueShader(shader2);
 
   gpu->flushQueue();
 
-  gpu->retrieveBuffer(data.data());
+  gpu->retrieveBuffer(bufferA, bufferAData.data());
+  gpu->retrieveBuffer(bufferB, bufferBData.data());
 
   auto endTime = std::chrono::high_resolution_clock::now();
   auto time = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
 
-  for (size_t i = 0; i < data.size(); ++i) {
-    std::cout << data[i] << " ";
-  }
-  std::cout << std::endl;
+  printBuffer(bufferAData);
+  printBuffer(bufferBData);
 
   std::cout << "Time elapsed: " << time << " microseconds" << std::endl;
 
   return EXIT_SUCCESS;
 }
 
-// 4 8 12 16 20 24 28 32 4 8 12 16 20 24 28 32 2 4 6 8 10 12 14 16 2 4 6 8 10 12 14 16
+// 4 8 12 16 20 24 28 32 4 8 12 16 20 24 28 32
+// 2 4 6 8 10 12 14 16 2 4 6 8 10 12 14 16
