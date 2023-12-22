@@ -61,15 +61,15 @@ int main() {
   std::string shader1Source = loadFile("shaders/shader.glsl");
   ShaderHandle shader1 = gpu->compileShader(shader1Source, { bufferA, bufferB }, { 16, 1, 1 });
 
-  //std::string shader2Source = loadFile("shaders/shader2.glsl");
-  //ShaderHandle shader2 = gpu->compileShader(shader2Source, { 16, 1, 1 });
+  std::string shader2Source = loadFile("shaders/shader2.glsl");
+  ShaderHandle shader2 = gpu->compileShader(shader2Source, { bufferB, bufferA }, { 16, 1, 1 });
 
   auto startTime = std::chrono::high_resolution_clock::now();
 
   gpu->submitBufferData(bufferA, bufferAData.data());
 
   gpu->queueShader(shader1);
-  //gpu->queueShader(shader2);
+  gpu->queueShader(shader2);
 
   gpu->flushQueue();
 
@@ -86,6 +86,3 @@ int main() {
 
   return EXIT_SUCCESS;
 }
-
-// 4 8 12 16 20 24 28 32 4 8 12 16 20 24 28 32
-// 2 4 6 8 10 12 14 16 2 4 6 8 10 12 14 16
