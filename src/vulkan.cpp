@@ -92,7 +92,6 @@ class Vulkan : public Gpu {
     //VkDescriptorSetLayout m_descriptorSetLayout;
     //VkPipelineLayout m_pipelineLayout;
     std::vector<Pipeline> m_pipelines;
-    size_t m_currentPipelineIdx; // TODO: Remove this?
     VkCommandPool m_commandPool;
     //VkCommandBuffer m_commandBuffer;
     std::vector<VkCommandBuffer> m_commandBuffers;
@@ -125,9 +124,6 @@ void Vulkan::destroyBuffers() {
 }
 
 BufferHandle Vulkan::allocateBuffer(size_t size, BufferFlags flags) {
-  // TODO: Remove
-  VK_CHECK(vkDeviceWaitIdle(m_device), "Error waiting for device to be idle");
-
   // TODO: Use flags arg
 
   Buffer buffer;
@@ -149,9 +145,6 @@ BufferHandle Vulkan::allocateBuffer(size_t size, BufferFlags flags) {
 }
 
 void Vulkan::submitBufferData(BufferHandle bufferHandle, const void* data) {
-  // TODO: Remove
-  VK_CHECK(vkDeviceWaitIdle(m_device), "Error waiting for device to be idle");
-
   // TODO: May not always need staging buffer
 
   VkBuffer stagingBuffer;
@@ -173,7 +166,7 @@ void Vulkan::submitBufferData(BufferHandle bufferHandle, const void* data) {
   vkUnmapMemory(m_device, stagingBufferMemory);
 
   copyBuffer(stagingBuffer, buffer.handle, buffer.size);
-  flushQueue(); // TODO
+  flushQueue();
 
   vkFreeMemory(m_device, stagingBufferMemory, nullptr);
   vkDestroyBuffer(m_device, stagingBuffer, nullptr);
@@ -240,18 +233,11 @@ ShaderHandle Vulkan::compileShader(const std::string& source, const BufferBindin
 }
 
 void Vulkan::queueShader(ShaderHandle shaderHandle) {
-  // TODO: Remove
-  VK_CHECK(vkDeviceWaitIdle(m_device), "Error waiting for device to be idle");
-
   VkCommandBuffer commandBuffer = createCommandBuffer();
   m_commandBuffers.push_back(commandBuffer);
 
   //vkResetCommandBuffer(commandBuffer, 0);
   dispatchWorkgroups(commandBuffer, shaderHandle, { 1, 1, 1 }); // TODO
-
-  flushQueue();
-    // TODO: Remove
-  VK_CHECK(vkDeviceWaitIdle(m_device), "Error waiting for device to be idle");
 }
 
 void Vulkan::flushQueue() {
@@ -279,9 +265,6 @@ void Vulkan::flushQueue() {
 }
 
 void Vulkan::retrieveBuffer(BufferHandle bufIdx, void* data) {
-  // TODO: Remove
-  VK_CHECK(vkDeviceWaitIdle(m_device), "Error waiting for device to be idle");
-
   Buffer& buffer = m_buffers[bufIdx];
 
   VkBuffer stagingBuffer;
@@ -296,7 +279,7 @@ void Vulkan::retrieveBuffer(BufferHandle bufIdx, void* data) {
   createBuffer(buffer.size, stagingUsage, flags, stagingBuffer, stagingBufferMemory);
 
   copyBuffer(buffer.handle, stagingBuffer, buffer.size);
-  flushQueue(); // TODO
+  flushQueue();
 
   void* stagingBufferMapped = nullptr;
   vkMapMemory(m_device, stagingBufferMemory, 0, buffer.size, 0, &stagingBufferMapped);
