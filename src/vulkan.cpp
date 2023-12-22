@@ -775,12 +775,10 @@ Vulkan::~Vulkan() {
   for (const auto& pipeline : m_pipelines) {
     vkDestroyPipeline(m_device, pipeline.handle, nullptr);
     vkDestroyPipelineLayout(m_device, pipeline.layout, nullptr);
-  vkDestroyDescriptorSetLayout(m_device, pipeline.descriptorSetLayout, nullptr);
+    vkDestroyDescriptorSetLayout(m_device, pipeline.descriptorSetLayout, nullptr);
   }
   destroyBuffers();
-  //destroyStagingBuffer();
   vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
-  //vkDestroyDescriptorSetLayout(m_device, m_descriptorSetLayout, nullptr);
 #ifndef NDEBUG
   destroyDebugMessenger();
 #endif

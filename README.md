@@ -1,3 +1,6 @@
+Building
+--------
+
 Install development libraries
 
 ```
@@ -7,12 +10,16 @@ Install development libraries
     vulkan-validationLayers-dev
 ```
 
-To build the app, from project root, run
+From the richard subdirectory, to make a release build, run
 
 ```
-  mkdir -p build
-  cd build
-  cmake -G "Unix Makefiles" ..
-  make -j8
+    cmake -B build/release -D CMAKE_BUILD_TYPE=Release
+    cmake --build build/release
 ```
 
+And for a debug build:
+
+```
+    cmake -B build/debug -D CMAKE_BUILD_TYPE=Debug
+    cmake --build build/debug
+```
