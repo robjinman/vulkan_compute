@@ -1,20 +1,8 @@
 #include "gpu.hpp"
 #include "types.hpp"
 #include <cstdlib>
-#include <fstream>
-#include <sstream>
 #include <chrono>
 #include <iostream>
-
-std::string loadFile(const std::string& path) {
-  std::ifstream fin(path);
-  std::stringstream ss;
-  std::string line;
-  while (std::getline(fin, line)) {
-    ss << line << std::endl;
-  }
-  return ss.str();
-}
 
 // Type of buffers
 //
@@ -58,11 +46,11 @@ int main() {
   BufferHandle bufferA = gpu->allocateBuffer(bufferAData.size() * sizeof(netfloat_t), 0);
   BufferHandle bufferB = gpu->allocateBuffer(bufferBData.size() * sizeof(netfloat_t), 0);
 
-  std::string shader1Source = loadFile("shaders/shader.glsl");
-  ShaderHandle shader1 = gpu->compileShader(shader1Source, { bufferA, bufferB }, { 16, 1, 1 });
+  ShaderHandle shader1 = gpu->compileShader("shaders/shader.glsl", { bufferA, bufferB },
+    { 16, 1, 1 });
 
-  std::string shader2Source = loadFile("shaders/shader2.glsl");
-  ShaderHandle shader2 = gpu->compileShader(shader2Source, { bufferB, bufferA }, { 16, 1, 1 });
+  ShaderHandle shader2 = gpu->compileShader("shaders/shader2.glsl", { bufferB, bufferA },
+    { 16, 1, 1 });
 
   auto startTime = std::chrono::high_resolution_clock::now();
 

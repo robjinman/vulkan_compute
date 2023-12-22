@@ -13,7 +13,7 @@ using BufferFlags = uint32_t;
 
 class Gpu {
   public:
-    virtual ShaderHandle compileShader(const std::string& source,
+    virtual ShaderHandle compileShader(const std::string& sourcePath,
       const BufferBindings& bufferBindings, const Size3& workgroupSize) = 0;
     virtual BufferHandle allocateBuffer(size_t size, BufferFlags flags) = 0;
     virtual void submitBufferData(BufferHandle buffer, const void* data) = 0;

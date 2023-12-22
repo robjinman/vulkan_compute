@@ -7,6 +7,9 @@
 #include <cstring>
 #include <algorithm>
 #include <map>
+#include <filesystem>
+#include <sstream>
+#include <fstream>
 
 #define VK_CHECK(fnCall, msg) \
   { \
@@ -17,6 +20,73 @@
   }
 
 namespace {
+
+std::string loadFile(const std::string& path) {
+  std::ifstream fin(path);
+  std::stringstream ss;
+  std::string line;
+  while (std::getline(fin, line)) {
+    ss << line << std::endl;
+  }
+  return ss.str();
+}
+
+class SourceIncluder : public shaderc::CompileOptions::IncluderInterface {
+  public:
+    SourceIncluder(const std::filesystem::path& sourcesDirectory)
+      : m_sourcesDirectory(sourcesDirectory) {}
+
+    shaderc_include_result* GetInclude(const char* requested_source,
+      shaderc_include_type type, const char* requesting_source, size_t include_depth) override;
+
+    void ReleaseInclude(shaderc_include_result* data) override;
+
+  private:
+    std::filesystem::path m_sourcesDirectory;
+    std::string m_errorMessage;
+};
+
+shaderc_include_result* SourceIncluder::GetInclude(const char* requested_source,
+  shaderc_include_type type, const char* requesting_source, size_t include_depth) {
+
+  auto result = new shaderc_include_result{};
+
+  try {
+    auto sourcePath = m_sourcesDirectory.append(requested_source);
+    std::ifstream stream(sourcePath, std::ios::binary | std::ios::ate);
+
+    ASSERT_MSG(stream.good(), "Error opening file " << sourcePath);
+
+    size_t contentLength = stream.tellg();
+    stream.seekg(0);
+
+    char* contentBuffer = new char[contentLength];
+    stream.read(contentBuffer, contentLength);
+
+    size_t sourceNameLength = sourcePath.string().length();
+    char* nameBuffer = new char[sourceNameLength];
+    strcpy(nameBuffer, sourcePath.c_str());
+
+    result->source_name = nameBuffer;
+    result->source_name_length = sourceNameLength;
+    result->content = contentBuffer;
+    result->content_length = contentLength;
+    result->user_data = nullptr;
+  }
+  catch (const std::exception& ex) {
+    m_errorMessage = ex.what();
+    result->content = m_errorMessage.c_str();
+    result->content_length = m_errorMessage.length();
+  }
+
+  return result;
+}
+
+void SourceIncluder::ReleaseInclude(shaderc_include_result* data) {
+  delete[] data->content;
+  delete[] data->source_name;
+  delete data;
+}
 
 const std::vector<const char*> ValidationLayers = {
   "VK_LAYER_KHRONOS_validation"
@@ -40,7 +110,7 @@ class Vulkan : public Gpu {
   public:
     Vulkan();
 
-    ShaderHandle compileShader(const std::string& source,
+    ShaderHandle compileShader(const std::string& sourcePath,
       const BufferBindings& bufferBindings, const Size3& workgroupSize) override;
     BufferHandle allocateBuffer(size_t size, BufferFlags flags) override;
     void submitBufferData(BufferHandle buffer, const void* data) override;
@@ -77,9 +147,7 @@ class Vulkan : public Gpu {
     void createSyncObjects();
     void destroyDebugMessenger();
     void destroyBuffers();
-    //void destroyStagingBuffer();
-    VkShaderModule createShaderModule(const std::string& source) const;
-    inline VkPipeline currentPipeline() const;
+    VkShaderModule createShaderModule(const std::string& sourcePath) const;
 
     VkInstance m_instance;
     VkDebugUtilsMessengerEXT m_debugMessenger;
@@ -87,16 +155,10 @@ class Vulkan : public Gpu {
     VkDevice m_device;
     VkQueue m_computeQueue;
     std::vector<Buffer> m_buffers;
-    //VkBuffer m_stagingBuffer;
-    //VkDeviceMemory m_stagingBufferMemory;
-    //VkDescriptorSetLayout m_descriptorSetLayout;
-    //VkPipelineLayout m_pipelineLayout;
     std::vector<Pipeline> m_pipelines;
     VkCommandPool m_commandPool;
-    //VkCommandBuffer m_commandBuffer;
     std::vector<VkCommandBuffer> m_commandBuffers;
     VkDescriptorPool m_descriptorPool;
-    //VkDescriptorSet m_descriptorSet;
     VkFence m_taskCompleteFence;
 };
 
@@ -107,11 +169,8 @@ Vulkan::Vulkan() {
 #endif
   pickPhysicalDevice();
   createLogicalDevice();
-  //createDescriptorSetLayout();
-  //createPipelineLayout();
   createCommandPool();
   createDescriptorPool();
-  //createCommandBuffer();
   createSyncObjects();
 }
 
@@ -174,10 +233,10 @@ void Vulkan::submitBufferData(BufferHandle bufferHandle, const void* data) {
   //createDescriptorSets();
 }
 
-ShaderHandle Vulkan::compileShader(const std::string& source, const BufferBindings& bufferBindings,
-  const Size3& workgroupSize) {
+ShaderHandle Vulkan::compileShader(const std::string& sourcePath,
+  const BufferBindings& bufferBindings, const Size3& workgroupSize) {
 
-  VkShaderModule shaderModule = createShaderModule(source);
+  VkShaderModule shaderModule = createShaderModule(sourcePath);
 
   const VkSpecializationMapEntry entries[] = {
     {
@@ -539,9 +598,16 @@ VkCommandBuffer Vulkan::createCommandBuffer() {
   return commandBuffer;
 }
 
-VkShaderModule Vulkan::createShaderModule(const std::string& source) const {
+VkShaderModule Vulkan::createShaderModule(const std::string& sourcePath) const {
   shaderc::Compiler compiler;
   shaderc::CompileOptions options;
+
+  auto sourcesDirectory = std::filesystem::path(sourcePath).parent_path();
+
+  options.SetIncluder(std::make_unique<SourceIncluder>(sourcesDirectory));
+
+  std::string source = loadFile(sourcePath);
+
   auto result = compiler.CompileGlslToSpv(source, shaderc_shader_kind::shaderc_glsl_compute_shader,
     "shader", options);
 
