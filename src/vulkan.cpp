@@ -6,7 +6,6 @@
 #include <vector>
 #include <cstring>
 #include <algorithm>
-#include <map>
 #include <filesystem>
 #include <sstream>
 #include <fstream>
@@ -20,16 +19,6 @@
   }
 
 namespace {
-
-std::string loadFile(const std::string& path) {
-  std::ifstream fin(path);
-  std::stringstream ss;
-  std::string line;
-  while (std::getline(fin, line)) {
-    ss << line << std::endl;
-  }
-  return ss.str();
-}
 
 class SourceIncluder : public shaderc::CompileOptions::IncluderInterface {
   public:
@@ -124,9 +113,7 @@ class Vulkan : public Gpu {
     static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT,
       VkDebugUtilsMessageTypeFlagsEXT, const VkDebugUtilsMessengerCallbackDataEXT* data, void*);
 
-    void checkValidationLayerSupport() const;
     VkDebugUtilsMessengerCreateInfoEXT getDebugMessengerCreateInfo() const;
-    std::vector<const char*> getRequiredExtensions() const;
     void createVulkanInstance();
     void setupDebugMessenger();
     void pickPhysicalDevice();
@@ -146,14 +133,13 @@ class Vulkan : public Gpu {
       const Size3& numWorkgroups);
     void createSyncObjects();
     void destroyDebugMessenger();
-    void destroyBuffers();
     VkShaderModule createShaderModule(const std::string& sourcePath) const;
 
     VkInstance m_instance;
     VkDebugUtilsMessengerEXT m_debugMessenger;
     VkPhysicalDevice m_physicalDevice;
     VkDevice m_device;
-    VkQueue m_computeQueue;
+    VkQueue m_computeQueue; // TODO: Separate queue for transfers?
     std::vector<Buffer> m_buffers;
     std::vector<Pipeline> m_pipelines;
     VkCommandPool m_commandPool;
@@ -174,38 +160,30 @@ Vulkan::Vulkan() {
   createSyncObjects();
 }
 
-void Vulkan::destroyBuffers() {
-  for (auto& buffer : m_buffers) {
-    vkDestroyBuffer(m_device, buffer.handle, nullptr);
-    vkFreeMemory(m_device, buffer.memory, nullptr);
-  }
-  m_buffers.clear();
-}
-
 void chooseVulkanBufferFlags(GpuBufferFlags flags, VkMemoryPropertyFlags& memProps,
-  VkBufferUsageFlags& usage, VkDescriptorType& type, bool& requireStagingBuffer) {
+  VkBufferUsageFlags& usage, VkDescriptorType& type, bool& memoryMapped) {
 
-  if (!!(flags & GpuBufferFlags::readonly) && !(flags & GpuBufferFlags::large)) {
+  if (!!(flags & GpuBufferFlags::shaderReadonly) && !(flags & GpuBufferFlags::large)) {
     type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
     memProps = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    requireStagingBuffer = false;
+    memoryMapped = true;
   }
   else {
     type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     if (!!(flags & GpuBufferFlags::frequentHostAccess)) {
-      requireStagingBuffer = false;
+      memoryMapped = true;
       memProps = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
     }
     else {
       if (!!(flags & GpuBufferFlags::hostReadAccess)) {
         usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        requireStagingBuffer = true;
+        memoryMapped = false;
       }
       if (!!(flags & GpuBufferFlags::hostWriteAccess)) {
         usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        requireStagingBuffer = true;
+        memoryMapped = false;
       }
       memProps = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     }
@@ -218,14 +196,14 @@ GpuBuffer Vulkan::allocateBuffer(size_t size, GpuBufferFlags flags) {
 
   VkMemoryPropertyFlags memProps = 0;
   VkBufferUsageFlags usage = 0;
-  bool requireStagingBuffer = false;
+  bool memoryMapped = false;
 
-  chooseVulkanBufferFlags(flags, memProps, usage, buffer.type, requireStagingBuffer);
+  chooseVulkanBufferFlags(flags, memProps, usage, buffer.type, memoryMapped);
 
   GpuBuffer gpuBuffer;
 
   createBuffer(size, usage, memProps, buffer.handle, buffer.memory);
-  if (!requireStagingBuffer) {
+  if (memoryMapped) {
     vkMapMemory(m_device, buffer.memory, 0, buffer.size, 0, &gpuBuffer.data);
   }
 
@@ -378,7 +356,7 @@ void Vulkan::retrieveBuffer(GpuBufferHandle bufIdx, void* data) {
   vkDestroyBuffer(m_device, stagingBuffer, nullptr);
 }
 
-void Vulkan::checkValidationLayerSupport() const {
+void checkValidationLayerSupport() {
   uint32_t layerCount;
   VK_CHECK(vkEnumerateInstanceLayerProperties(&layerCount, nullptr),
     "Failed to enumerate instance layer properties");
@@ -420,7 +398,7 @@ VkDebugUtilsMessengerCreateInfoEXT Vulkan::getDebugMessengerCreateInfo() const {
   return createInfo;
 }
 
-std::vector<const char*> Vulkan::getRequiredExtensions() const {
+std::vector<const char*> getRequiredExtensions() {
   std::vector<const char*> extensions;
 
 #ifndef NDEBUG
@@ -627,6 +605,16 @@ VkCommandBuffer Vulkan::createCommandBuffer() {
   return commandBuffer;
 }
 
+std::string loadFile(const std::string& path) {
+  std::ifstream fin(path);
+  std::stringstream ss;
+  std::string line;
+  while (std::getline(fin, line)) {
+    ss << line << std::endl;
+  }
+  return ss.str();
+}
+
 VkShaderModule Vulkan::createShaderModule(const std::string& sourcePath) const {
   shaderc::Compiler compiler;
   shaderc::CompileOptions options;
@@ -809,7 +797,10 @@ Vulkan::~Vulkan() {
     vkDestroyPipelineLayout(m_device, pipeline.layout, nullptr);
     vkDestroyDescriptorSetLayout(m_device, pipeline.descriptorSetLayout, nullptr);
   }
-  destroyBuffers();
+  for (auto& buffer : m_buffers) {
+    vkDestroyBuffer(m_device, buffer.handle, nullptr);
+    vkFreeMemory(m_device, buffer.memory, nullptr);
+  }
   vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
 #ifndef NDEBUG
   destroyDebugMessenger();

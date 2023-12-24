@@ -15,7 +15,7 @@ enum class GpuBufferFlags {
   hostReadAccess      = 1 << 1,
   hostWriteAccess     = 1 << 2,
   large               = 1 << 3,
-  readonly            = 1 << 4
+  shaderReadonly      = 1 << 4
 };
 
 constexpr GpuBufferFlags operator|(GpuBufferFlags a, GpuBufferFlags b) {

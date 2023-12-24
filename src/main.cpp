@@ -49,7 +49,7 @@ int main() {
   std::array<netfloat_t, 16> bufferBData{};
 
   GpuBuffer ubo = gpu->allocateBuffer(sizeof(Ubo),
-    GpuBufferFlags::frequentHostAccess | GpuBufferFlags::readonly);
+    GpuBufferFlags::frequentHostAccess | GpuBufferFlags::shaderReadonly);
 
   ASSERT_MSG(ubo.data != nullptr, "Expected ubo to be memory mapped");
 
@@ -74,10 +74,7 @@ int main() {
   constexpr size_t iterations = 3;
   for (size_t i = 0; i < iterations; ++i) {
     Ubo& uboData = *reinterpret_cast<Ubo*>(ubo.data);
-    uboData.a[0] = i;
-    uboData.a[1] = i + 1;
-    uboData.b[0] = i + 2;
-    uboData.b[1] = i + 3;
+    uboData = Ubo{{ i + 0.f, i + 1.f }, { i + 2.f, i + 3.f }};
 
     gpu->queueShader(shader1);
     gpu->queueShader(shader2);
