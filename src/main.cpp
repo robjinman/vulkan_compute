@@ -1,68 +1,92 @@
 #include "gpu.hpp"
 #include "types.hpp"
+#include "exception.hpp"
 #include <cstdlib>
 #include <chrono>
 #include <iostream>
 
-// Type of buffers
-//
-// Uniforms buffers (UBOs) for small, fixed-size read-only buffers
-// SSBO
-// Push constants - Small, frequently udpated data - more efficient than UBOs
-//
-// Flags determine which heap buffer is allocated from:
-// VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT - Fast, device local memory
-// VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT - For frequently updated input data
-// VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT - Host memory visible from GPU, good for staging buffers and UBOs
-// 
-
-/*
-Small, read-only, frequent inputs
-- Push constants
-- UBDs
-Large, frequent inputs, don't need staging buffer
-- SSBO - VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
-Large, device local, need staging buffer
-- VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
-
-*/
-
-void printBuffer(const std::vector<netfloat_t>& buffer) {
+template <size_t N>
+void printBuffer(const std::array<netfloat_t, N>& buffer) {
   for (size_t i = 0; i < buffer.size(); ++i) {
     std::cout << buffer[i] << " ";
   }
   std::cout << std::endl;
 }
 
+struct Ubo {
+  float a[2];
+  float b[2];
+};
+
+void computeExpectedOutput() {
+  std::array<netfloat_t, 16> A{ 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8 };
+  std::array<netfloat_t, 16> B{};
+
+  constexpr size_t iterations = 3;
+  for (size_t i = 0; i < iterations; ++i) {
+    Ubo ubo{{ i + 0.f, i + 1.f }, { i + 2.f, i + 3.f }};
+
+    for (size_t j = 0; j < A.size(); ++j) {
+      B[j] = A[j] * 2.f + ubo.a[0] + ubo.a[1] + ubo.b[0] + ubo.b[1];
+    }
+
+    for (size_t j = 0; j < A.size(); ++j) {
+      A[j] = B[j] * 3.f;
+    }
+  }
+
+  printBuffer(A);
+  printBuffer(B);
+}
+
 int main() {
   GpuPtr gpu = createGpu();
 
-  std::vector<netfloat_t> bufferAData{
+  std::array<netfloat_t, 16> bufferAData{
     1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8
   };
 
-  std::vector<netfloat_t> bufferBData(bufferAData.size());
+  std::array<netfloat_t, 16> bufferBData{};
 
-  BufferHandle bufferA = gpu->allocateBuffer(bufferAData.size() * sizeof(netfloat_t), 0);
-  BufferHandle bufferB = gpu->allocateBuffer(bufferBData.size() * sizeof(netfloat_t), 0);
+  GpuBuffer ubo = gpu->allocateBuffer(sizeof(Ubo),
+    GpuBufferFlags::frequentHostAccess | GpuBufferFlags::readonly);
 
-  ShaderHandle shader1 = gpu->compileShader("shaders/shader.glsl", { bufferA, bufferB },
-    { 16, 1, 1 });
+  ASSERT_MSG(ubo.data != nullptr, "Expected ubo to be memory mapped");
 
-  ShaderHandle shader2 = gpu->compileShader("shaders/shader2.glsl", { bufferB, bufferA },
-    { 16, 1, 1 });
+  GpuBuffer bufferA = gpu->allocateBuffer(bufferAData.size() * sizeof(netfloat_t),
+    GpuBufferFlags::large | GpuBufferFlags::hostReadAccess | GpuBufferFlags::hostWriteAccess);
+
+  GpuBuffer bufferB = gpu->allocateBuffer(bufferBData.size() * sizeof(netfloat_t),
+    GpuBufferFlags::large | GpuBufferFlags::hostReadAccess);
+
+  uint32_t gpuThreads = static_cast<uint32_t>(bufferAData.size());
+
+  ShaderHandle shader1 = gpu->compileShader("shaders/shader.glsl",
+    { ubo.handle, bufferA.handle, bufferB.handle }, { gpuThreads, 1, 1 });
+
+  ShaderHandle shader2 = gpu->compileShader("shaders/shader2.glsl",
+    { bufferB.handle, bufferA.handle }, { gpuThreads, 1, 1 });
 
   auto startTime = std::chrono::high_resolution_clock::now();
 
-  gpu->submitBufferData(bufferA, bufferAData.data());
+  gpu->submitBufferData(bufferA.handle, bufferAData.data());
 
-  gpu->queueShader(shader1);
-  gpu->queueShader(shader2);
+  constexpr size_t iterations = 3;
+  for (size_t i = 0; i < iterations; ++i) {
+    Ubo& uboData = *reinterpret_cast<Ubo*>(ubo.data);
+    uboData.a[0] = i;
+    uboData.a[1] = i + 1;
+    uboData.b[0] = i + 2;
+    uboData.b[1] = i + 3;
 
-  gpu->flushQueue();
+    gpu->queueShader(shader1);
+    gpu->queueShader(shader2);
 
-  gpu->retrieveBuffer(bufferA, bufferAData.data());
-  gpu->retrieveBuffer(bufferB, bufferBData.data());
+    gpu->flushQueue();
+  }
+
+  gpu->retrieveBuffer(bufferA.handle, bufferAData.data());
+  gpu->retrieveBuffer(bufferB.handle, bufferBData.data());
 
   auto endTime = std::chrono::high_resolution_clock::now();
   auto time = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
@@ -71,6 +95,8 @@ int main() {
   printBuffer(bufferBData);
 
   std::cout << "Time elapsed: " << time << " microseconds" << std::endl;
+
+  computeExpectedOutput();
 
   return EXIT_SUCCESS;
 }

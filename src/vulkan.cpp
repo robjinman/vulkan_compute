@@ -47,7 +47,7 @@ class SourceIncluder : public shaderc::CompileOptions::IncluderInterface {
 };
 
 shaderc_include_result* SourceIncluder::GetInclude(const char* requested_source,
-  shaderc_include_type type, const char* requesting_source, size_t include_depth) {
+  shaderc_include_type, const char*, size_t) {
 
   auto result = new shaderc_include_result{};
 
@@ -111,11 +111,11 @@ class Vulkan : public Gpu {
     Vulkan();
 
     ShaderHandle compileShader(const std::string& sourcePath,
-      const BufferBindings& bufferBindings, const Size3& workgroupSize) override;
-    BufferHandle allocateBuffer(size_t size, BufferFlags flags) override;
-    void submitBufferData(BufferHandle buffer, const void* data) override;
+      const GpuBufferBindings& bufferBindings, const Size3& workgroupSize) override;
+    GpuBuffer allocateBuffer(size_t size, GpuBufferFlags flags) override;
+    void submitBufferData(GpuBufferHandle buffer, const void* data) override;
     void queueShader(ShaderHandle shaderHandle) override;
-    void retrieveBuffer(BufferHandle buffer, void* data) override;
+    void retrieveBuffer(GpuBufferHandle buffer, void* data) override;
     void flushQueue() override;
 
     ~Vulkan();
@@ -135,11 +135,11 @@ class Vulkan : public Gpu {
     void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size);
     void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
       VkBuffer& buffer, VkDeviceMemory& bufferMemory) const;
-    VkDescriptorSetLayout createDescriptorSetLayout(const BufferBindings& buffers);
+    VkDescriptorSetLayout createDescriptorSetLayout(const GpuBufferBindings& buffers);
     VkPipelineLayout createPipelineLayout(VkDescriptorSetLayout descriptorSetLayout);
     void createCommandPool();
     void createDescriptorPool();
-    VkDescriptorSet createDescriptorSet(const BufferBindings& buffers,
+    VkDescriptorSet createDescriptorSet(const GpuBufferBindings& buffers,
       VkDescriptorSetLayout layout);
     VkCommandBuffer createCommandBuffer();
     void dispatchWorkgroups(VkCommandBuffer commandBuffer, size_t pipelineIdx,
@@ -182,30 +182,62 @@ void Vulkan::destroyBuffers() {
   m_buffers.clear();
 }
 
-BufferHandle Vulkan::allocateBuffer(size_t size, BufferFlags flags) {
-  // TODO: Use flags arg
+void chooseVulkanBufferFlags(GpuBufferFlags flags, VkMemoryPropertyFlags& memProps,
+  VkBufferUsageFlags& usage, VkDescriptorType& type, bool& requireStagingBuffer) {
 
+  if (!!(flags & GpuBufferFlags::readonly) && !(flags & GpuBufferFlags::large)) {
+    type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    memProps = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    requireStagingBuffer = false;
+  }
+  else {
+    type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    if (!!(flags & GpuBufferFlags::frequentHostAccess)) {
+      requireStagingBuffer = false;
+      memProps = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    }
+    else {
+      if (!!(flags & GpuBufferFlags::hostReadAccess)) {
+        usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        requireStagingBuffer = true;
+      }
+      if (!!(flags & GpuBufferFlags::hostWriteAccess)) {
+        usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        requireStagingBuffer = true;
+      }
+      memProps = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    }
+  }
+}
+
+GpuBuffer Vulkan::allocateBuffer(size_t size, GpuBufferFlags flags) {
   Buffer buffer;
-
-  VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT
-                           | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
-                           | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-  createBuffer(size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, buffer.handle, buffer.memory);
-
   buffer.size = size;
-  buffer.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+
+  VkMemoryPropertyFlags memProps = 0;
+  VkBufferUsageFlags usage = 0;
+  bool requireStagingBuffer = false;
+
+  chooseVulkanBufferFlags(flags, memProps, usage, buffer.type, requireStagingBuffer);
+
+  GpuBuffer gpuBuffer;
+
+  createBuffer(size, usage, memProps, buffer.handle, buffer.memory);
+  if (!requireStagingBuffer) {
+    vkMapMemory(m_device, buffer.memory, 0, buffer.size, 0, &gpuBuffer.data);
+  }
 
   m_buffers.push_back(buffer);
 
   // TODO: Can't just be an index if we allow buffer deletion
-  return m_buffers.size() - 1;
+  gpuBuffer.handle = m_buffers.size() - 1;
 
-  //createDescriptorSets();
+  return gpuBuffer;
 }
 
-void Vulkan::submitBufferData(BufferHandle bufferHandle, const void* data) {
-  // TODO: May not always need staging buffer
-
+void Vulkan::submitBufferData(GpuBufferHandle bufferHandle, const void* data) {
   VkBuffer stagingBuffer;
   VkDeviceMemory stagingBufferMemory;
 
@@ -229,12 +261,10 @@ void Vulkan::submitBufferData(BufferHandle bufferHandle, const void* data) {
 
   vkFreeMemory(m_device, stagingBufferMemory, nullptr);
   vkDestroyBuffer(m_device, stagingBuffer, nullptr);
-
-  //createDescriptorSets();
 }
 
 ShaderHandle Vulkan::compileShader(const std::string& sourcePath,
-  const BufferBindings& bufferBindings, const Size3& workgroupSize) {
+  const GpuBufferBindings& bufferBindings, const Size3& workgroupSize) {
 
   VkShaderModule shaderModule = createShaderModule(sourcePath);
 
@@ -295,7 +325,6 @@ void Vulkan::queueShader(ShaderHandle shaderHandle) {
   VkCommandBuffer commandBuffer = createCommandBuffer();
   m_commandBuffers.push_back(commandBuffer);
 
-  //vkResetCommandBuffer(commandBuffer, 0);
   dispatchWorkgroups(commandBuffer, shaderHandle, { 1, 1, 1 }); // TODO
 }
 
@@ -323,7 +352,7 @@ void Vulkan::flushQueue() {
   m_commandBuffers.clear();
 }
 
-void Vulkan::retrieveBuffer(BufferHandle bufIdx, void* data) {
+void Vulkan::retrieveBuffer(GpuBufferHandle bufIdx, void* data) {
   Buffer& buffer = m_buffers[bufIdx];
 
   VkBuffer stagingBuffer;
@@ -630,11 +659,11 @@ VkShaderModule Vulkan::createShaderModule(const std::string& sourcePath) const {
   return shaderModule;
 }
 
-VkDescriptorSetLayout Vulkan::createDescriptorSetLayout(const BufferBindings& buffers) {
+VkDescriptorSetLayout Vulkan::createDescriptorSetLayout(const GpuBufferBindings& buffers) {
   std::vector<VkDescriptorSetLayoutBinding> bindings;
 
   for (uint32_t slot = 0; slot < buffers.size(); ++slot) {
-    BufferHandle index = buffers[slot];
+    GpuBufferHandle index = buffers[slot];
     const Buffer& buffer = m_buffers[index];
 
     VkDescriptorSetLayoutBinding binding{};
@@ -661,21 +690,24 @@ VkDescriptorSetLayout Vulkan::createDescriptorSetLayout(const BufferBindings& bu
 }
 
 void Vulkan::createDescriptorPool() {
-  VkDescriptorPoolSize poolSize{};
-  poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  poolSize.descriptorCount = 16; // TODO
+  std::array<VkDescriptorPoolSize, 2> poolSizes{};
+  poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  poolSizes[0].descriptorCount = 16; // TODO
+
+  poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  poolSizes[1].descriptorCount = 16; // TODO
 
   VkDescriptorPoolCreateInfo poolInfo{};
   poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  poolInfo.poolSizeCount = 1;
-  poolInfo.pPoolSizes = &poolSize;
+  poolInfo.poolSizeCount = poolSizes.size();
+  poolInfo.pPoolSizes = poolSizes.data();
   poolInfo.maxSets = 4; // TODO
 
   VK_CHECK(vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_descriptorPool),
     "Failed to create descriptor pool");
 }
 
-VkDescriptorSet Vulkan::createDescriptorSet(const BufferBindings& buffers,
+VkDescriptorSet Vulkan::createDescriptorSet(const GpuBufferBindings& buffers,
   VkDescriptorSetLayout layout) {
 
   VkDescriptorSetAllocateInfo allocInfo{};
@@ -693,7 +725,7 @@ VkDescriptorSet Vulkan::createDescriptorSet(const BufferBindings& buffers,
   std::vector<VkWriteDescriptorSet> descriptorWrites(buffers.size());
 
   for (size_t slot = 0; slot < buffers.size(); ++slot) {
-    BufferHandle bufIdx = buffers[slot];
+    GpuBufferHandle bufIdx = buffers[slot];
     const Buffer& buffer = m_buffers[bufIdx];
 
     auto& bufferInfo = bufferInfos[slot];
@@ -706,7 +738,7 @@ VkDescriptorSet Vulkan::createDescriptorSet(const BufferBindings& buffers,
     descriptorWrite.dstSet = descriptorSet;
     descriptorWrite.dstBinding = slot;
     descriptorWrite.dstArrayElement = 0;
-    descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; // TODO: Support UBOs
+    descriptorWrite.descriptorType = buffer.type;
     descriptorWrite.descriptorCount = 1;
     descriptorWrite.pBufferInfo = &bufferInfo;
     descriptorWrite.pImageInfo = nullptr;
